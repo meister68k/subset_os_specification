@@ -212,6 +212,8 @@ int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence);
 int32_t sys_unlink(const char* path);
 int32_t sys_chdir(const char* path);
 int32_t sys_getdents(int32_t fd, void* buf, uint32_t count);
+int32_t sys_mkdir(const char* path, uint32_t mode);
+int32_t sys_rmdir(const char* path);
 
 }
 ```
