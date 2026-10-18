@@ -75,7 +75,7 @@ private:
     FdTable fd_table_;
     uint32_t cwd_inode_; // Filesystemのcwd参照をProcessが1つ所有する
     // Contextは後続のコンテキスト切り替え段階で追加する。
-    int exit_status_ = 0;
+    int32_t exit_status_ = 0;
 
     friend class ProcessManager;
 };
@@ -122,7 +122,7 @@ FREE -> CREATING -> READY -> RUNNING
 - `spawn()`の全準備成功後に限り`CREATING -> READY`とする。生成失敗は確保資源をロールバックし`FREE`へ戻す。生成失敗した子をZOMBIEとして残さない。
 - 以下のSchedulerによる状態遷移は、独立ContextとSchedulerを導入した実行段階に適用する。初期同期段階では`READY`はspawn済み・未実行を意味し、詳細は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 - Schedulerは`READY`を選択して`RUNNING`とし、実行権移譲では`RUNNING -> READY`、ブロック時は`RUNNING -> WAITING`、起床時は`WAITING -> READY`とする。
-- `exit()`開始で`RUNNING -> EXITING`とし、最後のスタック・Context等の資源回収をスケジューラ側コンテキストに移してから完了し、`EXITING -> ZOMBIE`へ遷移させる。`exit()`は呼び出し元へ復帰しない。
+- `exit(status)`開始で`RUNNING -> EXITING`とし、渡された`int32_t`値を終了ステータスとして保存する。最後のスタック・Context等の資源回収をスケジューラ側コンテキストに移してから完了し、`EXITING -> ZOMBIE`へ遷移させる。`exit()`は呼び出し元へ復帰しない。終了値をマスク、符号化、または狭い型へ切り詰めない。
 - `EXITING`は実行選択・`wait()`回収・スロット再利用の対象外。親の起床は`ZOMBIE`確定後とする。
 - `ZOMBIE`はPID、親PID、終了ステータスを残し、実行資源を保持しない。親の`wait()`で回収して初めて`FREE`となる。
 - 状態変更は`ProcessManager`に集約する。排他制御やプリエンプティブ/マルチプロセッサ対応の詳細は未確定。
@@ -137,9 +137,10 @@ FREE -> CREATING -> READY -> RUNNING
 
 - PIDの割当はテーブル添字に依存しない。
 - 通常の自動割当は1以上を循環し、既存のPIDと衝突させない。未回収の`ZOMBIE`に付与されたPIDも使用中とする。
+- `spawn()`および`wait()`のsyscall戻り値は共通ABIの`int32_t`であるため、有効な正のPIDは`INT32_MAX`以下に制限する。内部`pid_t`の具体型は未確定だが、syscall境界でPIDを`int32_t`へ安全に表現できなければならない。
 - PID 0を表現可能にし、特殊な用途のため予約する。当面、自動割当しない。
 - `init`にPID 1を与えることを通常の起動構成とする。
-- 無効PIDを`-1`などで表現すること、PID型を符号付き整数にすることは候補であり、公開ABI・上限・オーバーフロー処理と合わせて後日確定する。
+- 内部`pid_t`の符号・幅、無効PIDの表現、PID循環割当の具体的な探索・オーバーフロー処理は後日確定する。syscallに公開するPID値は上記の`int32_t`範囲に収める。
 - PIDの世代番号付与などは現段階では導入しない。再利用されたPIDを長期間保持する利用者への保証も未定義。
 
 将来の`kill()`において、UNIX互換の`kill(0, sig)`のような特別な意味を導入するかどうかは別途決定する。PID 0が表現可能であることだけをもって、各syscallの引数0の意味まで確定しない。
@@ -270,8 +271,9 @@ public:
         OptionalConstProcessRef parent
     );
 
-    [[noreturn]] void exit_current(int status);
+    [[noreturn]] void exit_current(int32_t status);
     WaitResult wait_child();
+    bool reap_child(pid_t child_pid);
 
 private:
     // Schedulerとの接続：名称と詳細契約は暫定
@@ -288,15 +290,15 @@ private:
 };
 ```
 
-通常のカーネル利用者に対する公開メソッドは、`find()`、`current()`、`spawn()`、`exit_current()`、`wait_child()`の5つを基本とする。`current()`はProcessが存在する文脈でのみ呼ぶ。Scheduler向けの状態更新は一般公開せず、詳細はScheduler仕様と合わせて決定する。内部表現の生ポインタは一般APIへ公開しない。
+通常のカーネル利用者に対する公開メソッドは、`find()`、`current()`、`spawn()`、`exit_current()`、`wait_child()`を基本とする。syscall境界で終了値の出力に成功してから子を回収するため、`reap_child(pid_t)`もProcessManagerの内部APIとして設ける。このAPIは指定PIDが呼出し元の子であり、まだ`ZOMBIE`である場合だけ`FREE`へ遷移させる。不一致や状態不整合の場合は失敗し、Process状態を変更しない。`current()`はProcessが存在する文脈でのみ呼ぶ。Scheduler向けの状態更新は一般公開せず、詳細はScheduler仕様と合わせて決定する。内部表現の生ポインタは一般APIへ公開しない。
 
 通常の`spawn()`は`std::cref(manager.current())`等を親として渡す。起動時の`init`生成では`std::nullopt`を指定し、`ppid = 0`とする。`std::nullopt`は「親Processなし」を表し、PID 0のProcessの参照を意味しない。子が起動時に使う`argv`の有効期間は親のスタックに依存させない。
 
 ### 10.3 生成・終了・待機の内部処理
 
 - **生成**：独立ContextとSchedulerを導入した段階では、`FREE`スロットを`CREATING`として予約し、PID・親子関係、プログラム・スタック・Context、FD継承を準備する。すべて成功したら`READY`とする。初期同期段階ではスタック・Contextを作らず、詳細仕様に従い`READY`（未実行）にする。途中失敗では確保資源を元に戻して`FREE`へ。PIDの欠番は許容する。
-- **終了**：`exit_current()`で`EXITING`へ遷移し、FDを解放し、孤児となる子（ZOMBIEを含む）を原則PID 1へ引き継ぐ。Schedulerへ非復帰で切り替えた後、`finish_exit()`相当の処理で終了プロセスが使っていたスタック・Context・実行イメージを回収し、`ZOMBIE`へ遷移させて親を起床させる。
-- **待機**：Scheduler導入後の`wait_child()`はZOMBIEの子があればPID・終了ステータスを返して`FREE`に戻す。子がいなければ`ECHILD`相当のエラー、未終了の子だけなら`WAITING(CHILD)`としてスケジューラへ移譲する。初期同期段階では、詳細仕様に従い最古の未実行子を関数呼出しで実行・回収して結果を返す。特定PID指定の`waitpid()`は現段階で追加しない。
+- **終了**：`exit_current(status)`で`EXITING`へ遷移し、`status`を`int32_t`のまま終了値として保存する。FDを解放し、孤児となる子（ZOMBIEを含む）を原則PID 1へ引き継ぐ。Schedulerへ非復帰で切り替えた後、`finish_exit()`相当の処理で終了プロセスが使っていたスタック・Context・実行イメージを回収し、PID・PPID・終了値を残した`ZOMBIE`へ遷移させて親を起床させる。`sys_exit(status)`は`exit_current(status)`へ委譲し、復帰しない。
+- **待機**：`wait_child()`は成功時に子PIDと終了値を返すが、その時点では子を`ZOMBIE`のまま保持する。`sys_wait(status_ptr)`は`status_ptr == nullptr`でない場合、syscall境界で出力先を検証し、安全なuser-copy経路で終了値を書き込む。書き込みが成功した後に限り`reap_child(pid)`を呼び、子を`FREE`へ戻す。出力先の検証または書き込みに失敗した場合は`-1`を返し、子を`ZOMBIE`のまま残して次回waitで回収可能にする。`status_ptr == nullptr`なら終了値の出力を省略し、回収を確定する。子がいなければ`ECHILD`相当のエラー、未終了の子だけなら`WAITING(CHILD)`としてスケジューラへ移譲する。初期同期段階では、詳細仕様に従い最古の未実行子を関数呼出しで実行し、結果出力成功後に回収する。特定PID指定の`waitpid()`は現段階で追加しない。
 - **init終了**：PID 1のinit終了時は通常の孤児引継ぎ・回収処理と区別し、カーネル側の停止処理へ移行する。停止の詳細は未確定。
 
 ### 10.4 今後決定する事項

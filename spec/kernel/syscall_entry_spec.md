@@ -45,6 +45,15 @@ UNIX互換システムコールおよび本OS固有システムコールは、�
 
 `btx::sys_xxx()` はユーザー側の型付きraw syscallラッパー、`kernel::sys_xxx()` はカーネル側の型付きハンドラとする。同じ `sys_xxx` 名を使用するが、名前空間と役割は明確に異なる。
 
+プロセス終了・待機の型付きラッパーとカーネルハンドラは、ABI幅を明示して次の形とする。
+
+```cpp
+int32_t btx::sys_exit(int32_t status); // 呼出し後は復帰しない
+int32_t btx::sys_wait(int32_t* status); // 成功時は子PID、失敗時は-1
+```
+
+`sys_wait`の`status == nullptr`は終了値出力を省略する指定である。非nullの出力先の検証と安全な書き込みはsyscall境界の責務とし、ProcessManagerの子回収を確定する前に完了させる。出力に失敗した場合は`-1`とし、対象の子Processを回収済みにしてはならない。詳細な終了・回収順序は[`process_management_spec.md`](process_management_spec.md)に従う。
+
 POSIX/UNIX風の `write()`、`read()` 等のライブラリAPIを別途提供する場合、それらは `btx::sys_xxx()` より上位のユーザーランド層とし、本書では規定しない。
 
 ### 2.2 ABI境界
