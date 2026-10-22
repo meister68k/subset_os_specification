@@ -214,6 +214,7 @@ int32_t sys_chdir(const char* path);
 int32_t sys_getdents(int32_t fd, void* buf, uint32_t count);
 int32_t sys_mkdir(const char* path, uint32_t mode);
 int32_t sys_rmdir(const char* path);
+int32_t sys_getcwd(char* buf, uint32_t capacity);
 
 }
 ```
@@ -399,6 +400,7 @@ V7由来のシステムコールについては、可能な範囲でV7の番号�
 | 66 | `getdents` | 本OS固有（V7定義範囲の63を超える） |
 | 67 | `mkdir` | 本OS固有（V7定義範囲の63を超える） |
 | 68 | `rmdir` | 本OS固有（V7定義範囲の63を超える） |
+| 69 | `getcwd` | 本OS固有 |
 
 今後追加するシステムコールの番号は、全体仕様書で採用対象となっているシステムコールとV7番号との対応を踏まえて決定する。
 
@@ -407,6 +409,7 @@ V7由来のシステムコールについては、可能な範囲でV7の番号�
 `unlink`のpathname解決、Filesystem連携、open中inodeの寿命は[`unlink_implementation_spec.md`](unlink_implementation_spec.md)に従う。
 `lseek`の32-bit position演算、seek不能target、FD共有offsetは[`lseek_implementation_spec.md`](lseek_implementation_spec.md)に従う。
 `chdir`のpathname検査、directory属性確認、Process cwd参照交換は[`chdir_implementation_spec.md`](chdir_implementation_spec.md)に従う。
+`getcwd`のcwd pathname再構成、戻り値、失敗規則は[`getcwd_implementation_spec.md`](getcwd_implementation_spec.md)に従う。
 `spawn()` / `wait()`の処理モデルは[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 
 ---
