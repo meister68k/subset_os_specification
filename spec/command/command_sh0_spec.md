@@ -3,9 +3,9 @@
 | 項目 | 内容 |
 |---|---|
 | 文書ID | SH-L0-SPEC-001 |
-| 版 | 0.4（`pwd`をシェル内cwd記憶方式に変更） |
+| 版 | 0.5（`pwd`を`getcwd` syscall利用に変更） |
 | 対象 | UNIXサブセットOSのシェルコマンド `sh0` |
-| 関連仕様 | INIT-SPEC-001 v0.1、ILIBC-REF-001 v0.1、`chdir_implementation_spec.md`、`process_management_spec.md` |
+| 関連仕様 | INIT-SPEC-001 v0.1、ILIBC-REF-001 v0.1、`chdir_implementation_spec.md`、`getcwd_implementation_spec.md`、`process_management_spec.md` |
 | 状態 | これまでの合意事項に基づく提案。未合意の境界条件は本書に「暫定」と明記 |
 
 ## 1. 目的と位置づけ
@@ -15,7 +15,6 @@
 - シェルはユーザー空間プログラムであり、カーネルにコマンド構文解析を追加しない。
 - 基本動作は **入力 → 分割 → 組み込み実行または外部プログラムの起動・待機 → 次の入力** の逐次実行とする。
 - 動的メモリ確保なし。入力行と引数配列は固定長とする。
-- cwd pathnameはシェル自身が固定長bufferに保持し、`pwd`はその値を表示する。OSの`getcwd` syscallには依存しない。
 - ilibcの公開APIは増やさず、OS側のシステムコールラッパと既存ilibcを利用する。
 - 初版で `exit` すればシェルは終了する。initから `wait` で起動されている場合、制御はinitへ戻る。
 
@@ -88,20 +87,17 @@ argv[3] = nullptr
 - `cd`はpathnameをちょうど1つ受け取る。`HOME`環境変数や前回のdirectoryを保持する機能がないため、引数省略時の既定directoryや`cd -`による移動は提供しない。
 - `cd path`は`btx::sys_chdir(path)`相当を1回呼び出す。directoryの存在確認、pathname解決、Process cwd参照の保持・交換は`chdir_implementation_spec.md`の責務とし、シェルが`stat()`やcwd inodeを直接操作しない。
 - 絶対pathはrootから、相対pathは現在のシェルProcessのcwdから解決する。成功後のcwdは以降の相対path syscallで使われる。
-- `sh0`は起動時にcwd文字列を`/`として初期化する（Process管理仕様上、initおよびspawnされたProcessの初期cwdはrootまたは親Processのcwd）。
-- `chdir()`を呼ぶ前に、cwd文字列とpathから移動後の絶対pathname候補を固定長buffer内で構成する。絶対pathはrootから、相対pathは保持中cwdから組み立て、空componentと`.`を除去し、`..`で直前componentへ戻す（rootより上には移動しない）。連続slashは1つとして扱う。候補がbufferに収まらない場合は診断し、`chdir()`を呼ばずcwd文字列も変更しない。
-- `chdir()`が`0`を返した場合に限り、候補pathnameをシェル内cwd文字列へ反映する。失敗時は文字列を更新しない。
 - 成功時は出力しない。失敗時はfd=2へ`sh:`を付けて診断し、次のプロンプトへ進む。失敗時のcwd状態は`chdir()` syscall仕様に従う（通常の検証失敗では不変だが、旧cwd参照release後の失敗では新cwdへ遷移済みの場合がある）。
 - `-`を含むpathも通常のpathnameとして渡し、optionや「前回directory」として解釈しない。空白区切りのみの構文のため、空白を含むpathnameは指定できない。
 - `spawn()`で起動される子Processは、Process管理仕様に従い`cd`後のcwdを継承する。
 
 #### `pwd`の動作
 
-- `pwd`は引数を取らない。引数が指定された場合はfd=2へ`sh:`を付けて使用方法を診断し、cwd記憶bufferの表示を行わず次のプロンプトへ進む。
-- `pwd`はcwd記憶bufferに保持した絶対pathnameとLFを標準出力へ出力する。root cwdは`/`と表示する。
-- cwd記憶bufferは128 byteとし、終端NULを含める。pathname本文は最大127 byteとする。`pwd`はProcess cwdを変更せず、cwd取得syscallも呼ばない。
+- `pwd`は引数を取らない。引数が指定された場合はfd=2へ`sh:`を付けて使用方法を診断し、`getcwd()`を呼ばず次のプロンプトへ進む。
+- `pwd`は`btx::sys_getcwd(buf, capacity)`相当を呼び、成功時に返るNUL終端pathnameとLFを標準出力へ出力する。root cwdは`/`と表示する。
+- 出力用固定長bufferは`PATH_MAX` byteとする。syscallの成功戻り値は終端NULを含む長さであり、出力時はNULを除いてpathnameを出力した後、LFを1 byte出力する。
+- `pwd`はProcess cwdを変更しない。cwdが削除済み等でrootからpathnameを復元できない場合、またはpathname取得・出力に失敗した場合はfd=2へ診断し、シェルを継続する。
 - 標準出力への書き込みに失敗した場合はfd=2へ診断し、シェルを継続する。
-- 表示する値はsh0が認識している論理pathnameである。外部Processがcwd directoryを`rmdir()`した場合や、`chdir()`がcwd更新後の後処理失敗で`-1`を返した場合、保持pathnameと実際のProcess cwdが一致しなくなる可能性がある。この方式ではそれらを再取得・検出できない。
 
 ### 4.2 実行ファイルの探索
 
@@ -209,7 +205,7 @@ Level 0では、**コマンド単位の失敗でシェルを終了しない**こ
 - プロンプトと診断：OSの標準fd 1/2への書き込み。
 - 外部コマンド起動・終了待ち：`spawn`、`wait`相当。
 - `cd`：`btx::sys_chdir(path)`相当の`chdir` syscall。
-- `pwd`：シェル内cwd記憶bufferのみを使用し、OS syscallを追加しない。
+- `pwd`：`btx::sys_getcwd(buf, capacity)`相当の`getcwd` syscall。
 - シェルの終了：`main()`のreturnからランタイムが終了システムコールを呼ぶ。
 - OS専用の入力バックエンドが必要。ILIBC-REF-001 v0.1では、`<cstdio>` のPOSIX用バックエンドが定義され、実機向けCUSTOMバックエンドは未実装という記述である。
 
@@ -238,9 +234,10 @@ Level 0では、**コマンド単位の失敗でシェルを終了しない**こ
 | `cd`成功後に外部コマンドを起動 | 子Processが更新後のcwdを継承 |
 | `pwd`をroot cwdで実行 | `/`とLFを出力し、cwd不変 |
 | `cd /tmp`成功後に`pwd` | `/tmp`とLFを出力 |
-| 相対`cd`のpathに`.`、`..`、連続slashを含む | syscall成功後、正規化した絶対pathnameを`pwd`で出力 |
-| cwd pathname候補がbuffer容量を超える`cd` | `chdir()`を呼ばず診断し、cwd文字列不変 |
-| `pwd extra` | 診断し、cwdを変更せず継続 |
+| 相対`cd`のpathに`.`、`..`、連続slashを含む | syscall成功後、実cwdから再構成した絶対pathnameを`pwd`で出力 |
+| cwd pathnameが出力buffer容量を超える | `pwd`が診断して継続 |
+| `pwd extra` | 診断し、`getcwd()`を呼ばず継続 |
+| 削除済みcwdで`pwd` | pathname取得失敗を診断して継続 |
 | `pwd`出力失敗 | 診断して継続し、Process cwd不変 |
 | 9引数のコマンド | 起動せずエラー、継続 |
 | 126文字ちょうどの本文とLF | 有効な行として処理可能 |
@@ -256,4 +253,3 @@ Level 0では、**コマンド単位の失敗でシェルを終了しない**こ
 2. `exit`の引数と終了コード、EOF直前の不完全行の処理。
 3. エラー時の継続・終了規則、入力のコメント行取り扱い。
 4. 内蔵バイナリ名と将来のフルパスの対応・解決方法。OS側の段階別spawn仕様と整合させる。
-5. sh0内のcwd記憶と`chdir()`の後処理失敗、cwd directory削除時に表示値が実cwdとずれる制限を、次段階でどのように扱うか。
