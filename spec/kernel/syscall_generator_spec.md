@@ -30,9 +30,16 @@ SYSTEMCALL int32_t sys_exit(int32_t status) {return system_call(1, status);}
 // No.2 未実装 (fork)
 SYSTEMCALL int32_t sys_read(int32_t fd, void* buf, uint32_t count) {return system_call(3, fd, buf, count);}
 SYSTEMCALL int32_t sys_write(int32_t fd, const void* buf, uint32_t count) {return system_call(4, fd, buf, count);}
+SYSTEMCALL int32_t sys_link(const char* oldpath, const char* newpath) {return system_call(9, oldpath, newpath);}
+SYSTEMCALL int32_t sys_getpid() {return system_call(20);}
+SYSTEMCALL int32_t sys_ioctl(int32_t fd, uint32_t request, void* argp) {return system_call(54, fd, request, argp);}
+SYSTEMCALL int32_t sys_pipe(int32_t* fd_r, int32_t* fd_w) {return system_call(42, fd_r, fd_w);}
+SYSTEMCALL int32_t sys_spawn(const char* name, const char** argv, const int32_t* inherit_fds, uint32_t inherit_fd_count) {return system_call(64, name, argv, inherit_fds, inherit_fd_count);}
+SYSTEMCALL int32_t sys_rename(const char* oldpath, const char* newpath) {return system_call(70, oldpath, newpath);}
 ```
 
 ユーザー側inline wrapperそのものがgeneratorへの入力であり、generatorはユーザー側wrapperを生成しない。
+`unistd.h`内の `ioctl()` / `isatty()` のような上位ユーザーランド関数は `SYSTEMCALL` 範囲外に置き、generatorの解析対象にしない。
 
 ## 3. 記述規約
 
@@ -521,6 +528,10 @@ SYSTEMCALL int32_t sys_exit(int32_t status) {return system_call(1, status);}
 // No.2 未実装 (fork)
 SYSTEMCALL int32_t sys_read(int32_t fd, void* buf, uint32_t count) {return system_call(3, fd, buf, count);}
 SYSTEMCALL int32_t sys_write(int32_t fd, const void* buf, uint32_t count) {return system_call(4, fd, buf, count);}
+SYSTEMCALL int32_t sys_link(const char* oldpath, const char* newpath) {return system_call(9, oldpath, newpath);}
+SYSTEMCALL int32_t sys_getpid() {return system_call(20);}
+SYSTEMCALL int32_t sys_ioctl(int32_t fd, uint32_t request, void* argp) {return system_call(54, fd, request, argp);}
+SYSTEMCALL int32_t sys_rename(const char* oldpath, const char* newpath) {return system_call(70, oldpath, newpath);}
 ```
 
 が存在する状態で、

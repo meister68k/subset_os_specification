@@ -1,6 +1,6 @@
 # 独自ファイルシステム実装プロジェクト 設計仕様書
 
-> **各層仕様同期版**: `00-overview.md`〜`11-mkdir.md`のphase 1契約を反映する。共通規約はルートの`AGENTS.md`、各レイヤーの詳細な契約・完了条件は各層仕様書を参照する。本書のAPI例・手順も同じ契約に従い、実装や検証の完了を示すものではない。
+> **各層仕様同期版**: `00-overview.md`〜`12-rename.md`のphase 1契約を反映する。共通規約はルートの`AGENTS.md`、各レイヤーの詳細な契約・完了条件は各層仕様書を参照する。本書のAPI例・手順も同じ契約に従い、実装や検証の完了を示すものではない。
 
 UNIX V7風の自作OS(サンデープロジェクト)における、ファイルシステム単体実装の設計まとめ。
 **実装言語は C++ とする**。ただし、Cortex-M0/68000への移植性とコードサイズを優先し、C++機能には4.4節の制限を設ける。
@@ -674,9 +674,11 @@ cache切替前にdirty blockを書き戻し、失敗時は新blockへ切り替�
 8. read/lseek(17節、`08-read-lseek.md`)
 9. unlink/close(18節、`09-unlink-close.md`)
 10. pathname/link(19〜20節、`10-pathname-link.md`)
-11. syscall接続
+11. mkdir/rmdir (21節、`11-mkdir.md`)
+12. pathname rename (12節、`12-rename.md`)
+13. syscall接続
 
-`mkdir()`は上記のinode・directory・link count・rollback経路を組み合わせるphase 1機能として、syscall接続前に21節と`11-mkdir.md`を満たす。各段階で下位層の単体テストを完了してから上位層へ進み、上位層が下位層のディスクレイアウトを直接操作しないことを確認する。
+`mkdir()`と`rename()`は上記のinode・directory・link count・rollback経路を組み合わせるphase 1機能として、syscall接続前にそれぞれ21節/`11-mkdir.md`、`12-rename.md`を満たす。各段階で下位層の単体テストを完了してから上位層へ進み、上位層が下位層のディスクレイアウトを直接操作しないことを確認する。
 
 ## 9. テスト方針
 
@@ -701,7 +703,7 @@ cache切替前にdirty blockを書き戻し、失敗時は新blockへ切り替�
 
 ## 11. 未確定・保留事項一覧
 
-phase 1の各層契約は`00-overview.md`〜`11-mkdir.md`と本書4〜21節にまとめる。FAT hint再構築、pathname、orphan lifetime、部分write、`mkdir()`は保留事項ではない。
+phase 1の各層契約は`00-overview.md`〜`12-rename.md`と本書4〜21節にまとめる。FAT hint再構築、pathname、orphan lifetime、部分write、`mkdir()`、限定renameは保留事項ではない。
 
 - phase 2のcluster/inode回収方式とmount再構築方式は、phase 2着手時に再検討する。
 - FAT8は現スコープ外の検討事項とする。
@@ -709,7 +711,7 @@ phase 1の各層契約は`00-overview.md`〜`11-mkdir.md`と本書4〜21節に�
 - 通常ファイルの末尾cluster cacheは必要性が判明した時点で、FD統合経路では`RegularFile`、Filesystem単体利用では`open_file_t`等のRAM専用open単位状態へ追加する。inodeには永続化しない。
 - open-but-unlinked状態でクラッシュすると、RAMのFilesystem側open handle表が失われ、`nlink == 0`のlive inodeが残留し得る。phase 1ではmount中に推測で回収しない。
 - truncateはphase 1で旧clusterを再利用可能にしないため、繰り返すと枯渇を早め得る。
-- VFS、統合mount名前空間、cross-device link、symlink、`rename()`、fsckは現スコープ外とする。`rmdir()`はphase 1対象で、詳細は`spec/kernel/mkdir_rmdir_implimentation_spec.md`を参照する。将来のVFS接続の検討箇所は19.5節を参照する。
+- VFS、統合mount名前空間、cross-device link、symlink、fsckは現スコープ外とする。`rename()`はphase 1の同一Filesystem・destination置換なしの限定APIとして`spec/filesystem/fs_impl_spec/fs_impl_spec_12-rename.md`に定める。`rmdir()`はphase 1対象で、詳細は`spec/kernel/mkdir_rmdir_implimentation_spec.md`を参照する。将来のVFS接続の検討箇所は19.5節を参照する。
 
 破損入力とI/O故障注入のテストは保留せず、各層の必須テストとして実施する。`creat()`、`link()`、`mkdir()`のrollbackは18.2節の共通helperを使い、最初の失敗statusを保持してdangling nameよりリークを優先する。
 

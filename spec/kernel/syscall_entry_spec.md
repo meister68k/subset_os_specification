@@ -208,12 +208,16 @@ namespace kernel {
 int32_t sys_putstrk(const char* msg);
 int32_t sys_read(int32_t fd, void* buf, uint32_t count);
 int32_t sys_write(int32_t fd, const void* buf, uint32_t count);
+int32_t sys_link(const char* oldpath, const char* newpath);
 int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence);
 int32_t sys_unlink(const char* path);
 int32_t sys_chdir(const char* path);
 int32_t sys_getdents(int32_t fd, void* buf, uint32_t count);
 int32_t sys_mkdir(const char* path, uint32_t mode);
 int32_t sys_rmdir(const char* path);
+int32_t sys_rename(const char* oldpath, const char* newpath);
+int32_t sys_dup(int32_t fd);
+int32_t sys_pipe(int32_t* fd_r, int32_t* fd_w);
 int32_t sys_getcwd(char* buf, uint32_t capacity);
 
 }
@@ -379,37 +383,115 @@ Cortex-M0版の `system_call()` は未実装とする。
 
 V7由来のシステムコールについては、可能な範囲でV7の番号を踏襲する。V7で廃止扱いとなっている0番を、本OS固有の `putstrk` に割り当てる。
 
-現時点で確定している番号は以下の通り。
+現在の `btx_unistd.h` の記述を基礎に、本仕様で有効とする型付きラッパーの一覧を以下に示す。「有効」はsyscall ABIとして採用済みであることを表し、カーネル実装完了を意味しない。各syscallの実装状態と動作契約は対応する個別仕様に従う。
 
-| 番号 | システムコール | 備考 |
+### 9.1 有効な型付きsyscallラッパー
+
+| 番号 | ラッパーとABIシグネチャ | 由来・備考 |
 | ---: | --- | --- |
-| 0 | `putstrk` | 本OS固有 |
-| 1 | `exit` | V7と同番号 |
-| 2 | `fork` | 本OSでは未実装・不採用。番号は予約 |
-| 3 | `read` | V7と同番号 |
-| 4 | `write` | V7と同番号 |
-| 5 | `open` | V7と同番号 |
-| 6 | `close` | V7と同番号 |
-| 7 | `wait` | V7と同番号 |
-| 8 | `creat` | V7と同番号 |
-| 10 | `unlink` | V7と同番号 |
-| 18 | `stat` | V7と同番号 |
-| 19 | `lseek` | V7と同番号 |
-| 35 | `sleep` | V6と同番号、V7ではftime |
-| 64 | `spawn` | 本OS固有（V7定義範囲の63を超える） |
-| 66 | `getdents` | 本OS固有（V7定義範囲の63を超える） |
-| 67 | `mkdir` | 本OS固有（V7定義範囲の63を超える） |
-| 68 | `rmdir` | 本OS固有（V7定義範囲の63を超える） |
-| 69 | `getcwd` | 本OS固有 |
+| 0 | `int32_t sys_putstrk(const char* msg)` | 本OS固有 |
+| 1 | `int32_t sys_exit(int32_t status)` | V7と同番号 |
+| 3 | `int32_t sys_read(int32_t fd, void* buf, uint32_t count)` | V7と同番号 |
+| 4 | `int32_t sys_write(int32_t fd, const void* buf, uint32_t count)` | V7と同番号 |
+| 5 | `int32_t sys_open(const char* path, uint32_t flags, uint32_t mode)` | V7と同番号 |
+| 6 | `int32_t sys_close(int32_t fd)` | V7と同番号 |
+| 7 | `int32_t sys_wait(int32_t* status)` | V7と同番号 |
+| 8 | `int32_t sys_creat(const char* path, uint32_t mode)` | V7と同番号 |
+| 9 | `int32_t sys_link(const char* oldpath, const char* newpath)` | V7と同番号 |
+| 10 | `int32_t sys_unlink(const char* path)` | V7と同番号 |
+| 12 | `int32_t sys_chdir(const char* path)` | V7と同番号 |
+| 18 | `int32_t sys_stat(const char* path, struct stat* buf)` | V7と同番号 |
+| 19 | `int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence)` | V7と同番号 |
+| 35 | `int32_t sys_sleep(uint32_t ticks)` | V6由来の番号。本OSでも採用 |
+| 41 | `int32_t sys_dup(int32_t fd)` | V7と同番号 |
+| 42 | `int32_t sys_pipe(int32_t* fd_r, int32_t* fd_w)` | V7と同番号。read/write fdをそれぞれ出力 |
+| 64 | `int32_t sys_spawn(const char* name, const char** argv, const int32_t* inherit_fds, uint32_t inherit_fd_count)` | 本OS固有。FD継承の指定はspawn/wait仕様に従う |
+| 66 | `int32_t sys_getdents(int32_t fd, void* buf, uint32_t count)` | 本OS固有 |
+| 67 | `int32_t sys_mkdir(const char* path, uint32_t mode)` | 本OS固有 |
+| 68 | `int32_t sys_rmdir(const char* path)` | 本OS固有 |
+| 69 | `int32_t sys_getcwd(char* buf, uint32_t capacity)` | 本OS固有 |
+| 70 | `int32_t sys_rename(const char* oldpath, const char* newpath)` | 本OS固有 |
 
-今後追加するシステムコールの番号は、全体仕様書で採用対象となっているシステムコールとV7番号との対応を踏まえて決定する。
+### 9.2 コメントアウトされたラッパー
+
+以下は提示されたヘッダーでコメントアウトされており、syscall generatorの入力には含まれない。
+
+| 番号 | ラッパー | 状態・備考 |
+| ---: | --- | --- |
+| 2 | `sys_fork()` | 実装予定なし。本OSでは採用せず、番号を予約する |
+| 11 | `sys_exec()` | 実装予定なし。プロセス起動は本OS固有の `spawn()` を用いる |
+| 13 | `sys_time()` | 実装予定なし |
+| 14 | `sys_mknod()` | 実装予定なし |
+| 15 | `sys_chnod()` | 実装予定なし |
+| 16 | `sys_chown()` | 実装予定なし |
+| 17 | `sys_break()` | 実装予定なし |
+| 21 | `sys_mount()` | 実装予定なし |
+| 22 | `sys_umount()` | 実装予定なし |
+| 23 | `sys_setuid()` | 実装予定なし |
+| 24 | `sys_getuid()` | 実装予定なし |
+| 25 | `sys_stime()` | 実装予定なし |
+| 26 | `sys_ptrace()` | 実装予定なし |
+| 27 | `sys_alarm()` | 実装予定なし |
+| 28 | `sys_fstat()` | 実装予定なし |
+| 29 | `sys_pause()` | 実装予定なし |
+| 30 | `sys_utime()` | 実装予定なし |
+| 31 | `sys_stty()` | 実装予定なし |
+| 32 | `sys_gtty()` | 実装予定なし |
+| 33 | `sys_access()` | 実装予定なし |
+| 34 | `sys_nice()` | 実装予定なし |
+| 36 | `sys_sync()` | 実装予定なし |
+| 37 | `sys_kill(int32_t pid, int32_t sig)` | 現ヘッダーでは無効 |
+| 38 | `sys_switch()` | 実装予定なし |
+| 39 | `sys_setpgrp()` | 実装予定なし |
+| 40 | `sys_tell()` | 実装予定なし |
+| 43 | `sys_times(struct tms* buf)` | 個別仕様はあるが、提示ヘッダーではコメントアウト |
+| 44 | `sys_prof()` | 実装予定なし |
+| 45 | `sys_unused()` | 実装予定なし |
+| 46 | `sys_setgid()` | 実装予定なし |
+| 47 | `sys_getgid()` | 実装予定なし |
+| 48 | `sys_signal(int32_t sig, void* handler)` | 現ヘッダーでは無効 |
+| 51 | `sys_sysacct()` | 実装予定なし |
+| 52 | `sys_sysphys()` | 実装予定なし |
+| 53 | `sys_lock()` | 実装予定なし |
+| 56 | `sys_mpxchan()` | 実装予定なし |
+| 59 | `sys_exece()` | 実装予定なし |
+| 60 | `sys_umask()` | 実装予定なし |
+| 61 | `sys_chroot()` | 実装予定なし |
+| 65 | `sys_spawne(const char* name, const char** argv, const char** env)` | 本OS固有案。現ヘッダーでは無効 |
+
+### 9.3 仕様で採用済みだが提示ヘッダー抜粋にないsyscall
+
+| 番号 | ラッパーとABIシグネチャ | 状態 |
+| ---: | --- | --- |
+| 20 | `int32_t sys_getpid()` | V7と同番号。仕様採用済み |
+| 54 | `int32_t sys_ioctl(int32_t fd, uint32_t request, void* argp)` | V7と同番号。仕様採用済み。初版要求は `BTX_TIOCISATTY` のみ |
+
+### 9.4 未定義番号
+
+提示されたヘッダーで未定義の番号は、未割当のままとする。
+
+| 番号 | 状態 |
+| ---: | --- |
+| 49–50 | 未定義 |
+| 55 | 未定義 |
+| 57–58 | 未定義 |
+| 62–63 | 未定義 |
+
+V7のシステムコール定義範囲は0–63である。64以降は本OS固有syscall用の範囲とし、番号を追加する際は本節の一覧とgeneratorの入力定義を同時に更新する。
+
+今後追加するシステムコールの番号は、全体仕様書で採用対象となっているシステムコールとV7番号との対応を踏まえて決定する。コメントアウトされたラッパーは有効なABI定義ではなく、明示的に有効化するまでは番号の空き状況・実装状態を変更しない。
 
 `mkdir` / `rmdir`のphase 1 syscall経路とFilesystem連携は[`mkdir_rmdir_implimentation_spec.md`](mkdir_rmdir_implimentation_spec.md)に従う。
+`rename`のpathname検証、Process cwd、Filesystem委譲は[`rename_implementation_spec.md`](rename_implementation_spec.md)に従う。
 `getdents`の戻り値、wire record、FD offset連携は[`getdents_implementation_spec.md`](getdents_implementation_spec.md)に従う。
 `unlink`のpathname解決、Filesystem連携、open中inodeの寿命は[`unlink_implementation_spec.md`](unlink_implementation_spec.md)に従う。
+`link`のpathname検証、hard link更新順序、Filesystem rollbackは[`link_implementation_spec.md`](link_implementation_spec.md)に従う。
 `lseek`の32-bit position演算、seek不能target、FD共有offsetは[`lseek_implementation_spec.md`](lseek_implementation_spec.md)に従う。
 `chdir`のpathname検査、directory属性確認、Process cwd参照交換は[`chdir_implementation_spec.md`](chdir_implementation_spec.md)に従う。
+`dup`の複製先fd割当、FileDescription参照管理、失敗時のrollbackは[`dup_implementation_spec.md`](dup_implementation_spec.md)に従う。
 `getcwd`のcwd pathname再構成、戻り値、失敗規則は[`getcwd_implementation_spec.md`](getcwd_implementation_spec.md)に従う。
+`getpid`が呼出し時点のcurrent ProcessのPIDを返す契約は[`getpid_implementation_spec.md`](getpid_implementation_spec.md)に従う。
+`ioctl`の限定要求、fd経由の委譲、および`isatty()`ラッパーは[`ioctl_implementation_spec.md`](ioctl_implementation_spec.md)に従う。
 `spawn()` / `wait()`の処理モデルは[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 
 ---

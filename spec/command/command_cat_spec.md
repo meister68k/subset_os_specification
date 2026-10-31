@@ -3,7 +3,7 @@
 | 項目 | 内容 |
 |---|---|
 | 文書ID | SUBSET-CAT-001 |
-| 版 | 0.1（実装前ドラフト） |
+| 版 | 0.3（ConsoleDevice標準入力の出力タイミングについてLinux既知の非互換を明記、重複記述を整理） |
 | 対象 | サブセットOSの `/bin/cat` |
 | 位置づけ | UNIX V7寄りの最小バイト列転送コマンド |
 
@@ -44,6 +44,9 @@ cat file1 - file2
 - `read()` が正値なら、そのバイト数すべてをfd=1へ出力する。短い読み込みはEOFとみなさず、次の`read()`を継続する。
 - `read()` が0なら、その入力元のEOFとして終了する。
 - `read()` が負値なら、その入力元の読み込みエラーとして扱う。
+- 標準入力がConsoleDeviceの場合、入力echoはConsoleDeviceの共有echo設定に従う。既定ONでは入力byteが入力時に表示される。
+- ConsoleDeviceの`read()`は要求`count`（推奨512バイト）が充足するかEOF/EOTに達するまで返らないため、`cat`はそれまで標準出力へ転送しない。Ctrl-D入力時または512バイト到達時にまとめて転送される。この出力タイミングはLinuxとの既知の非互換である（`open_file_description_spec.md` §7.3）。
+- ConsoleDevice上のCtrl-DはConsoleDevice仕様のEOFとして届く。同一readに先行byteがある場合はそのbyteが返され、次のreadでEOFとなるため、`cat`は入力済みbyteを出力して終了する。EOT byte自体は出力しない。通常ファイル内の`0x04`は通常データである。
 - `write()` の正の部分書き込みは残量を再送し、0または負値は書き込みエラーとして扱う。
 - 各入力ファイルは`open(path, O_RDONLY, ...)`で開き、処理後は`close(fd)`する。OSの実際の`open()`シグネチャに従う。
 - fd=0（標準入力）は`cat`自身が開いたFDではないため閉じない。

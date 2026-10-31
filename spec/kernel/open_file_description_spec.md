@@ -231,6 +231,7 @@ public:
     int32_t write(const void* buf, uint32_t count);
     int32_t getdents(void* buf, uint32_t count);
     int32_t seek(int32_t offset, uint32_t whence);
+    int32_t ioctl(uint32_t request, void* argp);
 
     uint32_t flags() const;
 
@@ -531,18 +532,23 @@ public:
 
     int32_t read(void* buf, uint32_t count) override;
     int32_t write(const void* buf, uint32_t count) override;
+    int32_t ioctl(uint32_t request, void* argp) override;
 };
 ```
 
-`init()`は`FileInterface::init()`のオーバーライドで、現在は空実装とする。`HAL::init_hal()`の後、`kernel::initialize_devices()`が非公開デバイス登録テーブルを登録順に走査して呼び出す。将来のConsoleDevice内部初期化はこのメソッドに追加できる。
+`ConsoleDevice::ioctl()`は [`ioctl_implementation_spec.md`](ioctl_implementation_spec.md) のTTY判定と共有echo ON/OFF/GET要求を受理する。これらの要求は `argp == nullptr` を使う。
 
-当面、コンソールは単純なbyte streamとして扱う。
+`init()`は`FileInterface::init()`のオーバーライドで、echoを既定ON、保留EOFをなしに初期化する。`HAL::init_hal()`の後、`kernel::initialize_devices()`が非公開デバイス登録テーブルを登録順に走査して呼び出す。
+
+当面、コンソールはcanonical modeや行単位バッファリングを持たないbyte streamとする。
+入力byteのechoだけは`ConsoleDevice`が共有状態で管理し、既定ONとする。echoのON/OFFは
+`ioctl_implementation_spec.md` のecho要求で切り替える。Ctrl-D (EOT, `0x04`) は入力EOFで、
+EOT自体はデータとして返さずechoもしない。read中にEOTより前のbyteを取得済みなら、その
+部分成功を返してpending EOFを次のreadで一度報告する。
 
 以下は本段階では`ConsoleDevice`の責務としない。
 
--   canonical mode
--   echo
--   行編集
+-   canonical mode / 行編集
 -   端末属性
 -   高度なバッファリング
 
@@ -591,6 +597,7 @@ void init_hal();
 void putchar(char ch);
 int32_t getchar();
 uint32_t get_tick_count();
+bool wait_for_tick_change(uint32_t observed_tick);
 
 }
 ```
@@ -600,7 +607,29 @@ uint32_t get_tick_count();
 `HAL::getchar()`はblocking
 APIとし、正常時は0〜255のbyte値、負値は入力終了またはエラーを表す。
 
-文字コード変換、CR/LF変換、echo等はHALでは行わない。
+`HAL::wait_for_tick_change()`は、協調Schedulerが実行可能Processのない状態でtickを待つためのblocking APIである。host実装の時計源・待機・失敗契約は[`host_hal_tick_wait_spec.md`](host_hal_tick_wait_spec.md)に従う。
+
+文字コード変換、CR/LF変換、echoはHALでは行わない。echoとEOTの処理はConsoleDeviceの責務とする。
+
+### 7.3 Linux/POSIX端末との既知の非互換（2026-10-25 調査記録）
+
+`cat`による標準入力の対話転送をLinuxと比較して差を調査した。方針は現状維持（実装変更なし）であり、以下は既知の非互換情報として記録する。ホストHALは実端末でcanonical/ECHOを無効化して起動するため、端末処理はすべて本OS側（`ConsoleDevice`）の責務となり、以下はそのままユーザーに見える挙動差になる。
+
+差の原因は独立した3つに分解できる。
+
+1.  **行バッファがない（canonical mode欠如）** — §7.1で延期と明記した項目。Linuxは改行入力で行単位で`read()`へ渡すため、コンソールから直接読むコマンドは行ごとに処理できる。本OSはbyte streamのため、改行を契機とした渡り方にならない。
+2.  **`read()`が`count`充足まで返さない（短縮readなし）** — `ConsoleDevice::read()`は`count`バイト充足かHAL入力終了/EOTまでブロックする。`cat`は512バイトを要求するため、Ctrl-D入力または512バイト打ち込みまで1バイトも返らず、転送出力もその時点まで遅れる。Linuxは到着済みbyteがあれば短い`read()`を返すため、canonical modeがなくてもchar単位で出力される。観察された「全入力後にまとめて出力される」の直接原因はこの要因であり、canonical mode欠如とは別の要因である。
+3.  **制御byteのline discipline処理がない** — LinuxはBS/DEL等を編集処理してデータに混入させず、`^H`等のキャリーエコーで表示する。本OSのechoは生byteのため、BS (`0x08`) は出力時にホスト端末でカーソルを左へ動かすだけで編集はされず、データにも`0x08`が残る。入力中にBSを打ち込むと`cat > file`等の出力内容がLinuxと異なる。
+
+対象範囲（現時点の実装）:
+
+-   sh0（`btx::readline()`）は該当しない。readlineは1バイト読みと自前編集を行うため、LinuxでICANONを無効にして動く行編集プログラムと同じ構造で動作する。
+-   `fgets`/`gets`は1バイトずつ読むため要因2の実害は小さいが、要因3の制御byte混入は受ける。現状コンソール入力での利用はない（`init`はファイル読み取り）。
+-   `cat`と`fread`等の`count > 1`の直接読み取りが要因2の全該当。`cat`の対話利用は非現実的と判断し現状維持とした。
+-   Ctrl-DのEOFは§7.1のpending EOFで対応済みで、canonical modeの部分行flushに相当する。
+-   端末由来の信号（Ctrl-C等）は本項目とは別の未実装項目である（`subset_os_overview_spec.md`のLv.2計画）。
+
+将来、(1) readlineを使わない対話入力プログラムを増やす、(2) POSIX端末ツールを移植する、のいずれかを狙う場合は、要因1〜3の解消とmode切替ioctl（readlineが自前編集を行うための非canonical切替を含む）が必要になり、その時点で§7.1の「別途仕様化」に着手する。
 
 ------------------------------------------------------------------------
 
@@ -674,7 +703,7 @@ bool initialize_standard_fds(
 
 ### 8.5 spawnによる継承
 
-`spawn()`は呼び出し元プロセスのオープン済みfdを子プロセスへ継承する。
+`spawn()`は指定されたfdを子プロセスへ継承する。`inherit_fds == nullptr && inherit_fd_count == 0`の場合は呼び出し元プロセスの全open fdを継承し、それ以外では指定リストのfdだけを継承する。各子fdは同じ番号で同じ`FileDescription`を参照し、参照数を増加させる。詳細は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 
 したがってルートプロセスにfd
 0/1/2を設定すれば、通常のfd継承機構によって子孫プロセスへ標準入出力を伝播できる。
@@ -706,8 +735,7 @@ fd[0] --> FileDescription --> Pipe
 fd[1] --> FileDescription --> Pipe
 ```
 
-読み書き端を同一の`Pipe`オブジェクトで表すか、read endpoint / write
-endpointを別オブジェクトとして表すか、バッファサイズ、blocking条件、EOF条件等の詳細はIPC（パイプ）の詳細仕様で決定する。
+read/write endpointの生成とFD登録は[`pipe_implementation_spec.md`](pipe_implementation_spec.md)に従う。buffer、blocking、EOF等のI/O詳細は[`pipe_io_implementation_spec.md`](pipe_io_implementation_spec.md)に従う。
 
 ------------------------------------------------------------------------
 
@@ -791,7 +819,7 @@ seek不能な対象は`FileInterface::seek()`の既定実装により`-1`を返�
 
 fd登録に失敗した場合は、途中まで確保した`FileDescription`参照を正しく解放する。
 
-詳細はIPC仕様に譲る。
+endpoint pairの生成、FileDescription作成、FdTableへの原子的な登録は[`pipe_implementation_spec.md`](pipe_implementation_spec.md)に従う。fd登録失敗時は途中まで確保したFileDescription参照とPipe資源をrollbackする。read/writeのblocking、EOF等は[`pipe_io_implementation_spec.md`](pipe_io_implementation_spec.md)に従う。
 
 ------------------------------------------------------------------------
 ## 11. 所有権と寿命
@@ -867,7 +895,7 @@ putstrk()
 -   `FileInterface`の実装差し替え境界では限定的にC++の`virtual`を使用してよい。
 -   RTTIは使用しない。
 -   `dynamic_cast`および`typeid`は使用しない。
--   `FileInterface`の共通操作は起動時初期化用の`init()`、I/O用の`read()` / `write()`、seek hookの`seek()`、最終参照解放時の`release()`とする。`init()`・`seek()`・`release()`はデフォルト実装を持ち、seek不能な対象は`seek()`の`-1`をそのまま利用できる。
+-   `FileInterface`の共通操作は起動時初期化用の`init()`、I/O用の`read()` / `write()`、seek hookの`seek()`、要求委譲用の`ioctl()`、最終参照解放時の`release()`とする。`init()`・`seek()`・`ioctl()`・`release()`はデフォルト実装を持つ。seek不能・未対応要求の対象は各hookの`-1`を利用できる。ioctl要求のABIと対応対象は個別仕様に従う。
 -   HALへfd、`FileDescription`、ファイルシステム等の上位概念を持ち込まない。
 -   ファイルシステムの`BlockDevice`抽象は維持し、HALへ統合しない。
 -   コンソールは当面byte streamとし、端末制御機能を先行して追加しない。
@@ -1062,6 +1090,7 @@ public:
 
     int32_t read(void* buf, uint32_t count) override;
     int32_t write(const void* buf, uint32_t count) override;
+    int32_t ioctl(uint32_t request, void* argp) override;
 };
 ```
 
@@ -1070,16 +1099,19 @@ public:
 `read()`は`HAL::getchar()`を利用する。
 
 初期実装では対話用途を優先し、`count > 0`の場合でも1 byte取得した時点で返してよい。
-canonical mode、echo、行単位バッファリングは導入しない。
+canonical modeや行単位バッファリングは導入しない。echoは既定ONで各通常入力byteを出力し、
+ioctlでOFFにもできる。EOT (`0x04`) を受信したとき、そのread内に先行byteがあればその
+部分成功を返して次readで一度だけ0を返す。先行byteがなければ直ちに0を返す。
 
 `count == 0`ではHALを呼ばず0を返す。
 
-`HAL::getchar()`が負値を返した場合のEOFとエラーの区別は、HAL側で現状区別されていないため、システムコール内部の扱いは別途エラー仕様で確定する。
+`HAL::getchar()`が負値を返した場合のEOFとエラーの区別は、HAL側で現状区別されていないため、既存どおり取得済みbyteがあれば部分成功、なければ0を返す。
 
 **完了条件**
 
 - `HAL::init_hal()`後の`kernel::initialize_devices()`から、登録された`ConsoleDevice::init()`が仮想呼び出しされる。
 - `ConsoleDevice::write()`からHALのコンソール出力へbyte列を出力できる。
+- `ConsoleDevice::read()`はecho ON/OFFに従い、EOTをデータbyteではなくEOFとして扱う。
 - `ConsoleDevice::read()`からホスト標準入力を読み出せる。
 - `count == 0`を正しく処理できる。
 

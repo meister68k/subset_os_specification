@@ -4,7 +4,7 @@
 
 本書は、呼出し元Processのcwdをrootからの絶対pathnameとして取得する`getcwd()` syscallを定める。Processは引き続きcwd inodeへの参照を所有する。pathname文字列をProcessテーブルに常時保持せず、呼び出しごとにFilesystemのdirectory関係から再構成する。
 
-phase 1はroot filesystem 1個、通常directory、`.` / `..`を含む既定pathname規則を対象とする。symlink、mount namespace、chroot、複数filesystem間のcwd、directory renameは対象外とする。
+phase 1はroot filesystem 1個、通常directory、`.` / `..`を含む既定pathname規則を対象とする。symlink、mount namespace、chroot、複数filesystem間のcwdは対象外とする。directory rename後はFilesystemの更新済み親関係に基づくpathnameを返す。
 
 ## 2. syscall ABI
 
@@ -98,13 +98,14 @@ syscall ABIはエラー原因を個別の戻り値として公開せず、全て
 - Filesystemのdirectory走査は、既存Filesystemの直列化契約内で行う。走査中に同一filesystemのdirectory mutationが割り込まないよう、Filesystem全体で定めた同期規則を使う。
 - `getcwd()`はpathname解決、`open()`、FD割当、cwd参照のretain/releaseを行わない。
 - directory内容、inode、FAT、時刻、Process cwd、FileDescription、file positionを変更しない。
-- 並行`rename()`は現段階の対象外。将来追加する場合は、pathname再構成と親・名前の一貫性を保証する同期・再試行契約をFilesystem仕様へ追加する。
+- `rename()`との同期はFilesystem全体のdirectory mutation直列化契約に従う。renameとgetcwdの走査が並行する実行モデルを導入する場合は、同じ親・名前関係の一貫性を保つ同期を適用する。
 
 ## 9. 受入確認項目
 
 - root cwdで`/\0`を返し、戻り値が2である。
 - root直下および複数階層のcwdで正しい絶対pathnameとNULを返す。
 - `.`、`..`、連続slashを経た`chdir()`後も、実際のdirectory entry名に基づく絶対pathnameを返す。
+- cwd directoryが別parentへrenameされた後、その新しい絶対pathnameを返す。
 - pathnameとNULがcapacityにちょうど収まる場合は成功し、1 byte不足では失敗してbufferへ部分pathnameを残さない。
 - null buffer、capacity 0、未mount、I/O故障、破損dirent、親循環を失敗として扱う。
 - `rmdir()`済みcwdで相対pathname操作は既存契約どおり可能だが、`getcwd()`は失敗する。

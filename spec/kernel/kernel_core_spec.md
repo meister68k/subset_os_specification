@@ -27,6 +27,8 @@
 
 ### 2.3 起動順序
 
+以下のシーケンスはFD検証用の初期単一Process段階を示す。協調Scheduler段階での起動は3.4節および[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従い、initを直接呼び出さずScheduler run loopへ入る。
+
 ```text
 （startup() 呼出し前）C++ランタイム・静的オブジェクト構築
     |
@@ -273,14 +275,15 @@ namespace kernel {
 
 - 内蔵プログラムの入口は `extern "C" int init(int, const char**);` のような関数である。
 - `user_binary(name)` は名前に一致する入口関数を返し、未登録の場合は `nullptr` を返す。
-- 現行テーブルでは文字列 `"init"` が `init` 関数に対応する。検索キーは現時点ではフルパス `"/sbin/init"` ではない。
+- 現行テーブルでは文字列 `"init"` が `init` 関数に対応する。検索キーは現時点ではフルパス `"/sbin/init"` ではない。すべてのターゲットで文字列 `"ps"` をデバッグ用内蔵バイナリへ対応付ける。[`command_sleep_spec.md`](../command/command_sleep_spec.md)に従い文字列 `"sleep"` を、[`command_schedtest_spec.md`](../command/command_schedtest_spec.md)に従い文字列 `"schedtest"`、worker aliasの`"schedtest-a"`、`"schedtest-b"`を、それぞれユーザーランド内蔵バイナリへ対応付ける。[`command_wc_spec.md`](../command/command_wc_spec.md)に従い文字列 `"wc"` をユーザーランド内蔵バイナリへ対応付ける。schedtestの3名は同じ入口関数を参照する。
 - テーブルは `internal_binary.h` に静的に定義され、現行実装では `constexpr` な名前・関数ポインタの対と終端用の門番を利用する。動的な登録・削除機能は持たない。
 - テーブル内で使用する関数ポインタは有効な静的リンク済みプログラムを指す。引数 `name` は有効なNUL終端文字列であることを呼び出し側の前提とする（現行実装はnull引数を検査しない）。
 - `user_binary()` はプログラムの検索のみ担当し、FD設定・プロセス生成・プログラム実行をしない。
+- `ps`内蔵バイナリはProcessManagerの診断専用内部APIを呼ぶ例外とし、個別仕様[`command_ps_debug_spec.md`](../command/command_ps_debug_spec.md)と[`process_debug_info_spec.md`](process_debug_info_spec.md)に従う。
 
 ### 3.3 initの起動
 
-`kernel::startup()` はHAL、デバイス、FileDescription、および標準FDの準備を終えた後で、`user_binary("init")` を呼び出す。戻り値が非nullであれば、次の引数で関数を直接呼び出す。
+初期単一Process段階では、`kernel::startup()` はHAL、デバイス、FileDescription、および標準FDの準備を終えた後で、`user_binary("init")` を呼び出す。戻り値が非nullであれば、次の引数で関数を直接呼び出す。この直接呼出しは初期段階に限り、協調Scheduler段階では3.4節の起動方式に置き換える。
 
 ```cpp
 const char* argv[] = {"init", nullptr};
@@ -297,6 +300,8 @@ if (entry != nullptr) {
 ### 3.4 当面のFdTableと将来のプロセス管理
 
 FD経路の初期テストでは、PID 1の最小Processを用意し、その**Processが所有する`FdTable`**を使用する。`initialize_standard_fds()` はこのテーブルにfd 0/1/2を設定してから `init` を実行する。`FdTable`はPID 1のProcessが所有する。`sys_read` / `sys_write`は`ProcessManager::current().fd_table()`からFDを取得する。
+
+協調Schedulerを有効にする段階では、標準FD初期化後にPID 1 `init`のProcess Contextとスタックを準備し、`user_binary("init")`の入口をそのContextへ登録して`READY`にしてからScheduler run loopを開始する。`init`をstartup Context上で直接呼び出さない。Schedulerの起動・終了・切替規則は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。
 
 将来 `spawn()` 等を実装するときにも、内蔵プログラムの名前から入口関数を検索する仕組みと、プロセスやFDの管理責務は分離する。共通ローダー等の新しい抽象化は現段階で追加しない。
 
@@ -331,6 +336,6 @@ FD経路の初期テストでは、PID 1の最小Processを用意し、その**P
 
 ## 7. FD検証用の最小Process起動段階（追加決定）
 
-本段階では`ProcessManager::initialize_init_process()`でPID 1（PPID 0）のProcessを`RUNNING`として登録し、Context・Scheduler・独立スタック・`spawn()`を実装せずに内蔵`init`を直接呼び出す。標準FDは当該Processの`FdTable`へ直接登録する。syscall層は`current().fd_table()`を通じて`FileDescription`にアクセスする。
+この節はFD検証用の初期単一Process段階を定める。本段階では`ProcessManager::initialize_init_process()`でPID 1（PPID 0）のProcessを`RUNNING`として登録し、Context・Scheduler・独立スタック・`spawn()`を実装せずに内蔵`init`を直接呼び出す。標準FDは当該Processの`FdTable`へ直接登録する。syscall層は`current().fd_table()`を通じて`FileDescription`にアクセスする。後続の協調Scheduler段階ではこの直接呼出しを3.4節のScheduler起動方式に置き換える。
 
 初期Process生成、標準FD初期化、内蔵バイナリ検索のいずれかに失敗した場合は`init`を実行しない。作成済み資源の適切な後始末は各サブシステムの既存契約に従い、カーネル停止・復旧方法は未確定とする。`init`関数からの復帰時の扱いも引き続き未確定とし、この段階で一般の`exit()`を実装したものとはみなさない。

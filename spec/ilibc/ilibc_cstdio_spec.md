@@ -335,6 +335,7 @@ namespace ilibc::detail {
 - 初版はPOSIX `::read()`を使用。POSIX `::read`が負値を返した場合、**ホスト側のエラー番号をその場で取得し**、ilibc側へコピーする。`ILIBC_HOST_TEST`ではホストの`errno`と`ilibc::detail::g_errno`は別の実体である。
 - `EINTR`を含め自動再試行しない。OSが返す番号を変換せず伝達する方針とし、ilibcの公開`<cerrno>`へ個々のPOSIX `E*`定数を網羅的に追加することは本初版の必要条件としない。
 - POSIX以外のバックエンドのうち、`ILIBC_IO_BACKEND_BTTX`は`btx::sys_read`を使用する（第5.2節）。固有の`read` ABIが本節のPOSIX規定と異なる場合も、正=バイト数・0=EOF・負=エラーの対応に従う。それ以外の独自OSバックエンドは例示に留め、固有の`read` ABIやエラーコードを本仕様の必須条件にしない。
+- BTTXバックエンドの`gets` / `fgets`自体はechoを行わない。fdの対象がConsoleDeviceなら入力byteのechoおよびCtrl-D EOF変換はConsoleDeviceの設定・仕様に従い、通常ファイル等では発生しない。
 - `err != nullptr`ならエラー時のみ`*err`を書き換え、成功およびEOFでは書き換えない。`err == nullptr`なら報告を破棄する。エラー番号を取得できないバックエンドについては導入時に適切な報告規則を個別規定する（BaTTaXの規定は第5.2節の`-1`、判断IO-10）。
 - `size`が`INT_MAX`を超える場合、`read_some`は実効的な要求サイズを`INT_MAX`に絞って読み込み、得られた正の部分読みをそのまま返す。呼び出し側（`fread`等）は短い読み込みを繰り返して完了させる。1バイト要求の`fgets`には影響しない。
 - ホスト側エラー番号の取得は公開`<cerrno>`を経由しない（`<errno.h>`はスタブのため）。POSIXバックエンドは`::read`の直後にそのホスト環境のエラー格納機構を直接参照して転送する。この参照は翻訳単位の外部依存としてTC-IO-13方式のnm検査対象となる。

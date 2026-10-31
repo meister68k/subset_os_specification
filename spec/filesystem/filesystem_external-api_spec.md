@@ -1,6 +1,6 @@
 # 外部仕様 — `Filesystem<Backend>` 利用者 API
 
-> 本書は `src/filesystem.h` を中心とした、ファイルシステム**を利用する側**(syscall 層・ライブラリ呼び出し側)の外部仕様である。レイヤー内部の実装契約は `spec/00`〜`spec/11`、全エラー定義は `spec/errors.md`、全レイヤー共通の制約は `AGENTS.md` を上位仕様とする。本書とコードの乖離があれば `filesystem.h` の現状を正とし、仕様矛盾として報告する。
+> 本書は `src/filesystem.h` を中心とした、ファイルシステム**を利用する側**(syscall 層・ライブラリ呼び出し側)の外部仕様である。レイヤー内部の実装契約は `spec/00`〜`spec/12-rename.md`、全エラー定義は `spec/errors.md`、全レイヤー共通の制約は `AGENTS.md` を上位仕様とする。本書とコードの乖離があれば `filesystem.h` の現状を正とし、仕様矛盾として報告する。
 
 ## 1. 範囲と対象外
 
@@ -15,7 +15,7 @@
 |---|---|
 | `Fat<Backend>` (`fat.h`) | 内部層。公開経路なし |
 | `InodeTable<Backend>` (`inode_table.h`) | 内部層。公開経路なし |
-| `Directory<Backend>` (`directory.h`) | 内部層。`creat`/`mkdir`/`unlink`/`resolve` が一時利用 |
+| `Directory<Backend>` (`directory.h`) | 内部層。`creat`/`mkdir`/`unlink`/`rename`/`resolve` が一時利用 |
 | `BlockDevice<Backend>` (`block_device.h`) | 内部層。`mount`/`unmount` が open/close |
 | `FilesystemTestProbe` | テスト専用 friend。本番呼び出し禁止 |
 
@@ -49,7 +49,7 @@
 | `ENODEV` | 未 mount、デバイス利用不能 |
 | `ENOSPC` | クラスタ・inode・open-file 表の枯渇 |
 | `ENOENT` | 名前・パス成分が存在しない |
-| `EEXIST` | 存在が禁止される対象が存在する(`mkdir()`、`link()` 等) |
+| `EEXIST` | 存在が禁止される対象が存在する(`mkdir()`、`link()`、`rename()` destination等) |
 | `EISDIR` | 通常ファイルが必要な操作へ directory を渡した、または Parent 解決で最終名が無い |
 | `ENOTEMPTY` | `rmdir()`対象directoryに`.`/`..`以外の有効entryがある |
 | `EINVAL` | 他に専用値が無い不正引数(空パス、負 seek、null 等) |
@@ -397,6 +397,30 @@ FsStatus close(open_file_t* file);
 - 最後の close でのみ `S_IUNUSED` へ遷移。
 - phase 1: クラッシュ時の open table 丧失により orphan が残留し得る。mount 中の推測回収はしない。
 
+### 8.5 cwd参照 — `retain_cwd()` / `release_cwd()`
+
+```cpp
+FsStatus retain_cwd(uint32_t inode_num);
+FsStatus release_cwd(uint32_t inode_num);
+```
+
+- Process の current working directory が指す directory inode への所有参照を固定長テーブル(`CwdRefTable`)で追跡する。1 entry は 1 個の所有参照を表し、**容量は `MAX_PROCESSES + 1` (= 33)**。`chdir()` の retain-new-before-release-old を同一 Process が一時的に 2 参照持つことに対応させる(`spec/kernel/mkdir_rmdir_implimentation_spec.md` §5)。
+- 同一 inode への複数 Process の参照は**独立した entry として数える**。参照数は Process 側では管理せず、本表が唯一の正本。
+- 上位層は本 API のみを使い、`CwdRefTable` の表現・スロットへ直接アクセスしない。
+
+| 操作 | 結果 |
+|---|---|
+| `retain_cwd(inode)` 成功 | 空きスロットへ `inode` を記録して `OK` |
+| `retain_cwd` 未 mount | `ENODEV`(状態変更なし) |
+| `retain_cwd` inode が未使用/削除済み/範囲外 | 下層の `EINVAL` / `ECORRUPT`(状態変更なし) |
+| `retain_cwd` 表枯渇 | `ENOSPC`(状態変更なし) |
+| `release_cwd(inode)` 成功 | 該当 entry を 1 個解放して `OK`。最後の参照消失時は orphan finalize 判定へ進む |
+| `release_cwd` 該当 entry なし(二重 release) | `EINVAL`(状態変更なし) |
+| `release_cwd` 未 mount | `ENODEV` |
+
+- `finalize_if_orphaned()` は open-file 参照に加え **cwd 参照も検査**し、両方がなく directory が空の場合に限り finalize する(`rmdir` 済み directory を Process が cwd として保持し続けることを許容)。
+- `cwd_refs_` は RAM 専用でありオンディスクに永続化しない。`mount()` 成功時と `unmount()` 時に `clear()` され、前の mount で残った参照を初期状態へ戻す(`open_files_` と同じ扱い)。
+
 ## 9. 読み書き
 
 ### 9.1 `write_at()` — byte 範囲プリミティブ
@@ -518,6 +542,34 @@ FsStatus unlink(uint32_t dir_inode_num, const char* name);
 - open 中のファイル: 名前と `nlink` が消えても内容は最後の `close` まで保持(§8.4)。
 - phase 1: cluster・inode スロットは再利用しない(`free_chain` は非回収)。
 - pathname syscallのcwd解決、user path検証、FDへの影響は`spec/kernel/unlink_implementation_spec.md`に従う。
+
+### 12.1 `link()`
+
+```cpp
+FsStatus link(uint32_t cwd_inode,
+              const char* oldpath,
+              const char* newpath);
+```
+
+- sourceとdestinationのpathnameを受け取り、同一Filesystem内にhard linkを作成する。
+- 相対pathは`cwd_inode`、絶対pathはrootから解決する。kernel syscall層でcwdとuser pathの安全性を検証してから呼び出す。
+- sourceがdirectoryなら`EISDIR`、destination名が存在すれば`EEXIST`とする。destinationを置換しない。
+- nlink増加後に新direntを公開する。dirent追加失敗時は`drop_link()`でrollbackする。更新順序は`spec/filesystem/fs_impl_spec/fs_impl_spec_10-pathname-link.md` §6に従う。
+- cross-filesystem linkとsymlinkは対象外。
+
+### 12.2 `rename()`
+
+```cpp
+FsStatus rename(uint32_t cwd_inode,
+                const char* oldpath,
+                const char* newpath);
+```
+
+- regular fileまたはdirectoryのpathnameを同一Filesystem内で変更・移動する。
+- 初版は既存destinationを置換せず、別inodeのentryが存在すれば`EEXIST`を返す。同一inodeならno-op成功。
+- directory移動時は`..`と親directory link countを整合させ、source自身または子孫への移動を拒否する。
+- open/cwd参照はinodeを保持し、pathname変更に伴い参照先inodeを交換しない。
+- Directory層連携、失敗・rollback、status詳細は`spec/filesystem/fs_impl_spec/fs_impl_spec_12-rename.md`を正本とする。crash consistencyは保証しない。
 
 ## 13. 属性取得 — `stat()`
 
@@ -659,10 +711,11 @@ if (fs.resolve_parent(fs::ROOT_INODE, "docs", &parent_ino, name) == fs::FsStatus
 | crash consistency | なし。途中までの書込みが残り得る |
 | fsck | なし。検出した破損は `ECORRUPT` で fail closed |
 | thread | **同一 `Filesystem` インスタンスへの並行呼び出し禁止**。外部で直列化する |
-| `link()` | `spec/10` §6 に定義があるが、**`filesystem.h` の公開 API には未導入** |
+| `link()` | §12.1および`spec/10` §6に従うhard link APIを提供 |
 | `mkdir()` | 親inode + 単一名で新規directoryを作成。詳細は`spec/11-mkdir.md` |
 | `rmdir()` | phase 1で提供。詳細は`spec/kernel/mkdir_rmdir_implimentation_spec.md` |
-| `rename` / `chmod` | 公開 API なし(`stat` は §13 で提供) |
+| `rename()` | §12.2に従いphase 1で提供。既存destination置換なし |
+| `chmod()` | 公開APIなし(`stat`は§13で提供) |
 | symlink / 跨 FS | 未サポート |
 | uid / gid | 常に 0 |
 | umask | `creat` / `mkdir` に適用しない |

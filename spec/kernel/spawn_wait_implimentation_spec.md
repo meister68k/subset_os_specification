@@ -1,18 +1,22 @@
-# 初期段階の `spawn()` / `wait()` 実装仕様
+# `spawn()` / `wait()` 実行仕様
 
 ## 1. 目的と適用範囲
 
-本書は、プロセス管理の初期実装における同期型 `spawn()` / `wait()` の動作を定める。既存の [`process_management_spec.md`](process_management_spec.md) にあるプロセス状態、PID、FD所有権、syscall境界の規則に従い、初期段階で未導入の独立スタック、Context層、Schedulerを前提としない。
+本書は、初期同期型およびScheduler無効の`NO_CONTEXT`互換モードにおける `spawn()` / `wait()` の動作を定める。既存の [`process_management_spec.md`](process_management_spec.md) にあるプロセス状態、PID、FD所有権、syscall境界の規則に従う。`HOST_UCONTEXT`でSchedulerを有効にした場合のdispatch、waitによるblock/wakeupは[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)を正とし、本書のwait駆動規則に優先する。Contextの資源契約は [`process_context_implementation_spec.md`](process_context_implementation_spec.md) に従う。
 
-この段階では `spawn()` は子Processを登録するだけで子のプログラムを実行しない。子の実行は親が `wait()` を呼んだときに限り、親の実行スタック上で同期的に行う。この方式は初期実装の足場であり、独立スタックとSchedulerを導入する後続段階の実行モデルを制約しない。
+`spawn()` は子Processを登録するだけで子のプログラムを実行しない。子の実行は親が `wait()` を呼んだときに限り、同期的に行う。`NO_CONTEXT`では親の実行スタック上で子入口を呼び、`HOST_UCONTEXT`では親子のContextを切り替えて子専用スタック上で実行する。
 
-本書の「実装 MUST」は初期同期段階に適用する。後続段階では、本書と異なる箇所を `process_management_spec.md` およびScheduler仕様で明示してから移行する。
+本書の生成引数・終了値・回収規則はScheduler有効時にも適用する。wait駆動の子選択と実行は`NO_CONTEXT`互換モードに限る。Scheduler有効時の子ProcessはSchedulerが選択する。実行対象の解決とシバン処理は[`shebang_execution_spec.md`](shebang_execution_spec.md)に従う。
 
-## 2. 初期段階の前提
+## 2. 実行モード共通の前提
 
-- 起動対象は静的リンクされた内蔵ユーザープログラムとする。名前は登録名とのバイト単位の完全一致で照合し、`/` を含む名前、別名、パス探索は扱わない。
-- ファイルシステム上の実行ファイルをロードする機能は本書の対象外であり、全体仕様が定める後続段階に残す。
-- 初期のユーザー向け呼出しは `spawn(name, argv)` とし、環境変数配列は受け取らない。後続段階で環境変数を扱う場合は別途仕様を定める。
+- `name`はまず内蔵ユーザープログラム表の登録名とバイト単位で完全一致照合する。一致した場合は内蔵プログラムを直接起動する。一致しない場合は`name`をFilesystem pathnameとして扱い、外部実行ファイルまたはシバンスクリプトの起動を試みる。内蔵名とpathnameが衝突した場合は内蔵プログラムを優先する。
+- 内蔵プログラム名に`/`を含めない。`!echo`のような名前は予約された名前空間ではなく、通常の登録名である。完全一致する登録があるときだけ内蔵プログラムを選ぶ。
+- Filesystem pathnameの絶対・相対解決は呼出し元Processのcwdを基準とする。`PATH`検索は`spawn()`で行わない。
+- ホスト環境で受理するFilesystem実行ファイル形式とロード方法は[`host_elf32_subset_spec.md`](host_elf32_subset_spec.md)に従う。シバン判定と引数変換は[`shebang_execution_spec.md`](shebang_execution_spec.md)に従う。
+- ユーザー向け呼出しは`spawn(name, argv, inherit_fds, inherit_fd_count)`とする。環境変数配列は受け取らない。FD継承リストの詳細は§3.3に従う。
+- syscall ABIを変更するため、既存の2引数`sys_spawn(name, argv)`とのバイナリ互換性は維持しない。ユーザー側wrapperと呼出し側は新しい4引数ABIで再ビルドする。
+- `name`は内蔵登録名またはFilesystem pathnameを指定し、Processの表示名としても元の文字列を保持する。NUL終端を含めて最大128 byte（文字列長127 byte）とし、生成時にProcess所有の固定長領域へコピーする。上限超過や終端NULのない入力は生成失敗とする。
 - `argv` はNULL終端配列とする。`argv[0]` はプログラムの引数列に含め、要素数は最大16、すべての文字列の終端NULを含む合計格納量は最大256バイトとする。
 - 空文字列の引数は許可する。プログラム名 `name` の空文字列は許可しない。
 - `argv` の各文字列はProcessの固定長領域へコピーする。子Processは親のスタック上にある引数文字列を参照してはならない。
@@ -22,25 +26,34 @@
 
 ### 3.1 動作と結果
 
-ユーザー向け `spawn(name, argv)` は名前を内蔵プログラム表で解決し、ProcessManagerの通常の生成処理へ委譲する。既存の内部APIが入口関数ポインタを受け取る構成の場合、名前解決後にその入口関数を渡す。名前解決や引数検証は子の実行を開始しない。
+ユーザー向け`spawn(name, argv, inherit_fds, inherit_fd_count)`は、内蔵名との完全一致を先に照合する。一致時はその入口関数を選び、一致しない場合はFilesystem pathnameとして外部実行対象を解決する。外部対象がシバンスクリプトならinterpreterと変換後のargvを解決する。いずれも実行対象を確定した後、ProcessManagerの通常の生成処理へ委譲する。名前解決・ファイル読込・引数検証は子の実行を開始しない。
 
-生成処理は空きProcess枠を `CREATING` として予約し、PID、親子関係、入口関数、コピー済み引数、継承FDを準備する。すべて成功した場合に限り `READY` へ遷移させ、呼出し元へ子PIDを返す。この段階の `READY` は「生成済み・未実行」を示し、Schedulerで実行可能なContextが存在することを意味しない。
+生成処理は空きProcess枠を `CREATING` として予約し、PID、親子関係、入口関数、コピー済み引数、継承FDを準備する。`HOST_UCONTEXT`では子専用スタックとContextも初期化する。すべて成功した場合に限り `READY` へ遷移させ、呼出し元へ子PIDを返す。`READY` は両モードで「生成済み・未実行」を示す。
 
-`spawn()` は入口関数を呼び出さず、親の `current()` を変更せず、CPUコンテキスト切替も行わない。
+`spawn()` は入口関数を呼び出さず、親の `current()` を変更せず、Context切替も行わない。
 
 ### 3.2 引数の検査と保持
 
-- `name` はNULLでなく、空文字列でなく、登録名として受け付ける単一名でなければならない。`/` を含む名前は拒否する。
+- `name` はNULLでなく、空文字列でなく、NUL終端され、既存の`name`長上限内でなければならない。登録名との完全一致に失敗した`name`はpathnameとして解決する。pathname不正、ファイル不存在、読込失敗または実行形式不正は生成失敗とする。
 - `argv` はNULLでなく、最大16要素以内にNULL終端が必要である。`argv[0]` を必須とし、全文字列がNUL終端されていなければならない。
 - 各文字列のNULを含む合計サイズが256バイト以内であることを、コピー前に検査する。個数または合計サイズの上限超過は生成失敗とする。
 - 引数文字列のコピー先と要素参照配列はProcess自身が所有し、Processが回収されるまで有効とする。固定長領域を用い、一般ヒープを必要としない。
 - `argv[0]` と `name` が一致することは要求しない。両者の文字列はそれぞれ独立して検査・コピーする。
+- Process名は`name`引数のコピーであり、`argv[0]`から再構成・置換しない。
+- シバン実行時もProcess表示名は呼出し元が指定した元の`name`とする。interpreter名で置き換えない。
 
 ### 3.3 FD継承と失敗時の処理
 
-親の各オープン済みFDについて、子の `FdTable` に同じ `FileDescription` を登録し、FDごとに `retain_file_description()` を行う。FileDescriptionやfile positionを複製せず、テーブルの単純コピーで代用しない。FDの付け替え属性は `spawn()` に設けず、呼出し元が事前に `open()` / `dup()` で準備する。
+`inherit_fds`と`inherit_fd_count`で子へ継承するfd番号を指定する。継承先fd番号は親と同じとし、fdの再配置・複製・close等のfile actionsは行わない。必要なfd付け替えは呼出し元が`open()` / `dup()`でspawn前に準備する。
 
-名前不正・未登録名、引数不正・上限超過、Process枠不足、PID割当失敗、またはFD継承失敗ではPIDを返さない。`CREATING` 中に失敗した場合、登録済みFDをdetachして各参照をreleaseし、コピー済み引数と予約状態を破棄してProcess枠を `FREE` に戻す。生成失敗した子を `ZOMBIE` として残さない。PIDの欠番は許容する。
+- `inherit_fds == nullptr && inherit_fd_count == 0`は、親の全open fdを継承する従来動作とする。
+- `inherit_fds != nullptr && inherit_fd_count == 0`はfdを1つも継承しない。
+- `inherit_fds != nullptr && 1 <= inherit_fd_count <= MAX_FD`は、配列に列挙したfdだけを継承する。
+- `inherit_fds == nullptr && inherit_fd_count != 0`、`inherit_fd_count > MAX_FD`、リスト中の重複fd、未使用または範囲外fdは生成失敗とする。FDリストは指定count分だけ読む。無効なユーザーポインタによるfault/crashは本OSのユーザーポインタ前提に従い許容する。
+- 指定fdについて子の`FdTable`に親と同じ`FileDescription`を登録し、fdごとに`retain_file_description()`を行う。FileDescriptionやfile positionを複製せず、テーブルの単純コピーで代用しない。
+- NULL/0は全継承、非NULL/0は継承なしであり、両者を混同しない。
+
+名前不正、内蔵名と一致せずFilesystem pathnameとしても解決できない場合、引数不正・上限超過、Process枠不足、PID割当失敗、またはFD継承失敗ではPIDを返さない。`CREATING` 中に失敗した場合、登録済みFDをdetachして各参照をreleaseし、コピー済み引数と予約状態を破棄してProcess枠を `FREE` に戻す。生成失敗した子を `ZOMBIE` として残さない。PIDの欠番は許容する。
 
 syscallハンドラはABI引数を検査・変換して内部処理へ委譲し、エラーを既存のsyscallエラー規約へ変換する。具体的なerrno数値や `ProcessResult` の表現は本書では新設しない。
 
@@ -50,19 +63,19 @@ syscallハンドラはABI引数を検査・変換して内部処理へ委譲し�
 
 `wait()` は呼出し元の子Processのうち、まだ実行されていない子を生成順で1つ選ぶ。Processテーブルのスロット位置やPIDの大小を生成順の代用にしてはならない。生成順の記録は固定長Processテーブル内の有限な管理情報で行い、動的メモリを使わない。
 
-選んだ子を `RUNNING` とし、親は論理的に `WAITING(CHILD)` とする。ProcessManagerの `current()` を子に切り替えた後、子の内蔵入口関数を通常のC++関数呼び出しとして実行する。これはCPUコンテキストスイッチではなく、親の呼出しフレームとスタックはそのまま保持される。
+選んだ子を `RUNNING` とし、親は論理的に `WAITING(CHILD)` とする。ProcessManagerの `current()` を子に切り替える。`NO_CONTEXT`では子の入口関数を通常のC++関数呼び出しとして実行し、`HOST_UCONTEXT`では親Contextを保存して子Contextへ切り替える。
 
 子の入口関数が戻った時点で、その戻り値を`int32_t`の終了ステータスとして保存し、終了処理を行う。終了処理では子のFD参照を解放し、子を `ZOMBIE` とする。同じ`wait()`呼出し内で親を`RUNNING`に戻し、`current()`を親に復元して、終了した子のPIDとステータスを返す。ProcessManager内部のwait結果取得だけでは子を回収しない。syscall経由の場合は、`status`出力先への書き込みに成功してから回収を確定する。出力先検証または書き込みに失敗した場合は子を`ZOMBIE`のまま残し、後続の`wait()`で再取得できるようにする。内部APIを直接使うカーネル利用者は、結果を受け取った後に`reap_child(pid)`で回収を確定する。
 
-子の入口関数が実行中にさらに `spawn()` / `wait()` を呼んだ場合も同じ規則を再帰的に適用する。親Processの `current()` はネストした待機が完了した時点で子へ復元され、最上位の子が戻った時点で元の親へ復元される。
+子の入口関数が実行中にさらに `spawn()` / `wait()` を呼んだ場合も同じ規則を再帰的に適用する。親Processの `current()` はネストした待機が完了した時点で子へ復元され、最上位の子が終了した時点で元の親へ復元される。Context有効時の詳細は[`process_context_implementation_spec.md`](process_context_implementation_spec.md)に従う。
 
-### 4.2 初期段階での終了・待機の制約
+### 4.2 終了・待機の制約
 
 - 子プログラムの正常終了は入口関数からのreturnで表す。戻り値を`int32_t`終了ステータスとして保持し、値をマスク・符号化・切り詰めしない。
-- 初期段階では `exit()` / `sys_exit` による非復帰終了を実装しない。ユーザープログラムは入口関数からreturnしなければならない。
-- 子が未実行の間、その子は `READY` のまま残る。初期段階にSchedulerによる自動実行、プリエンプション、`sleep()`による実行権移譲はない。
+- `NO_CONTEXT`では `exit()` / `sys_exit` による非復帰終了を実装せず、子入口関数のreturnを終了として扱う。`HOST_UCONTEXT`では子の`exit(status)`は非復帰で親Contextへ戻る。入口関数の通常returnも同じ終了経路へ合流する。
+- 子が未実行の間、その子は `READY` のまま残る。Contextの有無によらずSchedulerによる自動実行、プリエンプション、`sleep()`による実行権移譲はない。
 - 未実行の子が複数ある場合、1回の `wait()` は最古の1子だけを実行・回収する。
-- 子が1つも存在しない場合、`wait()` は `ECHILD` 相当の失敗を返す。初期同期段階では、実行中の子を非同期に待つためのブロックやSchedulerへの移譲は行わない。
+- 子が1つも存在しない場合、`wait()` は `ECHILD` 相当の失敗を返す。実行中の子を非同期に待つSchedulerへの移譲は行わない。
 - 子がreturnした後に未実行の子を残していた場合、孤児化した子の親子関係は既定の孤児引継ぎ規則に従ってPID 1へ引き継ぐ。実行は自動開始せず、PID 1がwaitしたときに実行する。
 
 ## 5. 状態と所有権
@@ -81,20 +94,22 @@ wait:
 
 `current()` は、入口関数を実行している間だけ子を指し、return後は必ず呼出し元Processを指す。FD参照、コピー済みargv、Process枠の所有者と解放順序は `process_management_spec.md` および `open_file_description_spec.md` に従う。入口関数return後から `wait()` の結果返却までの終了・回収処理に失敗した場合、Process枠やFD参照を早まって再利用してはならない。
 
-## 6. 後続段階への移行
+## 6. `NO_CONTEXT`互換モード
 
-独立スタック・Context層・Schedulerを導入する段階では、子Processごとに実行スタックと初期Contextを生成し、`spawn()` 完了後に `READY` とする。Schedulerが子を実行し、親の `wait()` は子が `ZOMBIE` になるまで待機する。後続段階では子の `exit()` がreturnに代わる非復帰の終了経路となり、スタック・Contextの回収は終了Process自身のスタック上で行わない。
+`NO_CONTEXT`でwait駆動互換動作を使う場合、子Processは`spawn()`完了後に`READY`となり、親の`wait()`が未実行の子を選んで親スタック上で呼び出す。`HOST_UCONTEXT`ではwait駆動選択方式を使わず、[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。
 
-この後続モデルの具体的なContext API、スタック容量、プリエンプション方式、実行イメージ形式は本書では確定しない。初期同期段階の `READY` の意味を後続段階へそのまま適用しない。
+Context API、スタック・ガードページ、コンパイル選択は[`process_context_implementation_spec.md`](process_context_implementation_spec.md)に従う。
 
 ## 7. 受け入れ確認項目
 
 - `spawn()` 成功後も入口関数が実行されず、親の `current()` が変化しない。
-- 未登録名、区切りを含む名前、NULLまたは空の名前、NULLのargv、NULL終端欠如、17要素、256バイト超過が失敗し、子PIDを返さない。argv中の空文字列は有効な引数として扱う。
+- NULLまたは空の名前、Filesystem pathnameとしても解決できない名前、NULLのargv、NULL終端欠如、17要素、256バイト超過が失敗し、子PIDを返さない。登録名に`/`を含まないこと、pathnameに`/`を含められることを確認する。argv中の空文字列は有効な引数として扱う。
 - 16要素かつ合計256バイトのargvは成功し、子の引数が親の引数領域と独立している。
 - 複数の子は `wait()` ごとに生成順で1つ実行される。各子は一度だけ実行され、PIDとreturn値が返る。
 - 子の実行中 `current()` が子を指し、ネストしたwaitおよび子return後に適切な親へ復元される。
 - wait対象なしは `ECHILD` 相当となり、ProcessやFD状態を変更しない。
 - Process枠不足およびFD継承途中の失敗で、参照数、FdTable、引数保持領域、Process状態が成功時の外部状態を残さない。
-- 初期段階では独立スタック生成、Context初期化、Scheduler dispatch、CPUコンテキストスイッチが呼ばれない。
+- `NO_CONTEXT`では独立スタック生成、Context初期化、Scheduler dispatch、Context切替が呼ばれず、従来どおり親スタック上でwait駆動実行する。
+- `HOST_UCONTEXT`でSchedulerを有効にする構成の確認項目は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)を参照する。
+- FD継承指定の`nullptr`かつ非0 count、count上限超過、重複・未使用・範囲外fdが失敗し、子を公開せず参照数を元に戻す。`nullptr, 0`は全継承、非NULL pointer/count 0は継承なし、指定リストは指定fdのみを同番号で継承する。
 - 子return後に残った子がPID 1へ引き継がれ、PID 1がwaitするまで未実行である。

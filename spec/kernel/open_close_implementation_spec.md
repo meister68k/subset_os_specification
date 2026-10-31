@@ -87,9 +87,12 @@ public:
     virtual int32_t read(void* buf, uint32_t count) = 0;
     virtual int32_t write(const void* buf, uint32_t count) = 0;
     virtual int32_t seek(int32_t offset, uint32_t whence) { return -1; }
+    virtual int32_t ioctl(uint32_t request, void* argp) { return -1; }
     virtual int32_t release() { return 0; }
 };
 ```
+
+`ioctl()`は要求ごとのデバイス制御用hookであり、既定では未対応として失敗する。要求コードと引数契約は個別のioctl仕様で定義する。初版の `BTX_TIOCISATTY` は [`ioctl_implementation_spec.md`](ioctl_implementation_spec.md) に従う。
 
 `read()` / `write()`にはoffset引数を持たせない。通常ファイルのfile positionは
 `RegularFile`内部で管理し、Filesystemとの境界でのみ

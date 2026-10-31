@@ -99,13 +99,13 @@ argv[3] = NULL
 2. 先頭から1物理行ずつ取得する。
 3. 行長・改行・コメントを処理し、4フィールドへ分割する。
 4. `id` の長さ、`action`、`process`、引数数を検査する。`runlevels` の値は無視する。
-5. 有効なエントリは `process` を直接起動し、その終了を待つ。**次のエントリを起動するのは終了待ち後**とする。
+5. 有効なエントリは `process` を直接起動し、その終了を待つ。`spawn()`は`nullptr, 0`を指定して全open fdを継承し、標準入出力を含むinitのFD環境を維持する。**次のエントリを起動するのは終了待ち後**とする。
 6. EOFまで繰り返す。
 7. ファイルを閉じ、init 自身は終了してよい。
 
 初版ではエントリを蓄積せず、1行分の固定長バッファと固定長 `argv` 配列で順次処理する。
 
-> **プロセス関連の保留**：spawn/wait/exitの正確なAPI形状、起動失敗時の戻り値および終了ステータス形式は、OS実装段階で確定する。
+`spawn()` / `wait()`のAPIと失敗規約は[`../kernel/spawn_wait_implimentation_spec.md`](../kernel/spawn_wait_implimentation_spec.md)に従う。各エントリの起動には全FD継承(`inherit_fds == nullptr`, `inherit_fd_count == 0`)を指定する。
 
 ## 4. エラー処理
 

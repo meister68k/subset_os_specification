@@ -2,7 +2,7 @@
 
 ## 1. 目的と位置づけ
 
-本書はAncient UNIX風サブセットOSにおけるプロセス管理の基本構造、および今後の設計に対する制約を定める。現時点までに合意した項目を仕様とし、結果型・エラー表現・Schedulerとの詳細な接続等の未確定事項は区別する。
+本書はAncient UNIX風サブセットOSにおけるプロセス管理の基本構造、および今後の設計に対する制約を定める。現時点までに合意した項目を仕様とし、ProcessManager内部の具体的な結果型・エラー表現等の未確定事項は区別する。Schedulerの動作契約は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)を正とする。
 
 - 上位仕様：`subset_os_overview_spec.md`
 - 起動順序・内蔵プログラム：`kernel_core_spec.md`
@@ -19,8 +19,9 @@ UNIX V7程度の外部機能を目標とするが、その内部実装の再現�
 - 最初の通常ユーザープロセスは`init`とし、通常PID 1を与える。
 - PIDはテーブル添字とは独立した循環割当方式を採用する。通常の自動割当はPID 1以上とする。PID 0は将来の特別用途のために確保し、有効なPIDとして表現できる設計にする。現段階ではPID 0のProcessを作らない。
 - 各Processが自身の`FdTable`を持ち、マルチタスク対応段階では実行コンテキストも持つ。`FileDescription`本体はシステム全体で共有する。
+- 各Processは生成時に指定された実行名を固定長で保持する。`spawn(name, argv, inherit_fds, inherit_fd_count)`では`name`をProcess名とし、`argv[0]`とは独立して扱う。初期Process `init`の名前は`init`とする。名前の最大長とコピー規則は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 - 実行中のProcessを指す内部参照（概念的にはポインタ）を管理し、通常のsyscallはこれを経由してプロセス固有のFD等へアクセスする。
-- プロセスの管理責務（生成・状態・回収）と、実行対象を選ぶスケジューラの責務を分離する。
+- プロセスの管理責務（生成・状態・回収）と、実行対象を選ぶSchedulerの責務を分離する。協調切替・選択順・待機連携は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。
 - さらにコンテキスト保存・復元の機構を独立した**Context層**に分離する。
 
 ### 2.1 構成と所有関係
@@ -36,7 +37,7 @@ kernel::startup() （Process外）
     |     +-- Process ...   |
     |                       +-- 別ProcessのFdTableからも参照可能
     |
-    +-- Scheduler（後続段階で詳細決定）
+    +-- 協調Scheduler（[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)）
             |
             +-- Context層（CPU/ホスト依存の保存・復帰）
 ```
@@ -70,18 +71,19 @@ public:
 private:
     pid_t pid_ = -1;
     pid_t ppid_ = -1;
+    char name_[128]; // spawn nameのコピー。上限と初期化規則はspawn/wait仕様に従う
     ProcessState state_ = ProcessState::FREE;
     WaitReason wait_reason_ = WaitReason::NONE;
     FdTable fd_table_;
     uint32_t cwd_inode_; // Filesystemのcwd参照をProcessが1つ所有する
-    // Contextは後続のコンテキスト切り替え段階で追加する。
+    // ContextはHOST_UCONTEXTで有効。実装型はContext層に隠す。
     int32_t exit_status_ = 0;
 
     friend class ProcessManager;
 };
 ```
 
-この例は実際のコンストラクタや型の確定を意味しない。`Context`を値として保持するか、独立管理領域への参照にするか、スタックを誰が所有するかは未確定。`FdTable&`を公開する場合も、そのクラス自身の操作契約を迂回した操作を許す趣旨ではない。
+この例は実際のコンストラクタや型の確定を意味しない。Contextの共通内部表現とビルド時の有効化条件は[`process_context_implementation_spec.md`](process_context_implementation_spec.md)に従う。`FdTable&`を公開する場合も、そのクラス自身の操作契約を迂回した操作を許す趣旨ではない。
 
 ### 3.2 プロセス状態（確定）
 
@@ -105,7 +107,7 @@ enum class WaitReason : uint8_t {
 | `EXITING` | 終了処理中。資源解放が未完了 |
 | `ZOMBIE` | 実行資源の解放完了、親の回収待ち |
 
-`WaitReason`は`ProcessState`と独立して保持する。初期段階は`NONE`と`CHILD`を実装し、`SLEEP`と`IO`は後続段階で使用する。通常の非待機状態では`NONE`を用いる。
+`WaitReason`は`ProcessState`と独立して保持する。協調Schedulerは`NONE`、`CHILD`、`SLEEP`に加え、[`pipe_io_implementation_spec.md`](pipe_io_implementation_spec.md)に定めるpipe read/writeの`IO`待機を実装する。device I/Oの`IO`待機は対象外とする。通常の非待機状態では`NONE`を用いる。
 
 主な状態遷移は以下とする。
 
@@ -120,11 +122,11 @@ FREE -> CREATING -> READY -> RUNNING
 ```
 
 - `spawn()`の全準備成功後に限り`CREATING -> READY`とする。生成失敗は確保資源をロールバックし`FREE`へ戻す。生成失敗した子をZOMBIEとして残さない。
-- 以下のSchedulerによる状態遷移は、独立ContextとSchedulerを導入した実行段階に適用する。初期同期段階では`READY`はspawn済み・未実行を意味し、詳細は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
-- Schedulerは`READY`を選択して`RUNNING`とし、実行権移譲では`RUNNING -> READY`、ブロック時は`RUNNING -> WAITING`、起床時は`WAITING -> READY`とする。
-- `exit(status)`開始で`RUNNING -> EXITING`とし、渡された`int32_t`値を終了ステータスとして保存する。最後のスタック・Context等の資源回収をスケジューラ側コンテキストに移してから完了し、`EXITING -> ZOMBIE`へ遷移させる。`exit()`は呼び出し元へ復帰しない。終了値をマスク、符号化、または狭い型へ切り詰めない。
+- Scheduler有効時の状態遷移、dispatchとwait連携は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。Scheduler無効の`NO_CONTEXT`互換段階では`READY`はspawn済み・未実行を意味し、wait駆動方法は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
+- Schedulerは協調Scheduler仕様に従い`READY`を選択して`RUNNING`とし、yieldでは`RUNNING -> READY`、blockでは`RUNNING -> WAITING`、起床時は`WAITING -> READY`とする。
+- `exit(status)`開始で`RUNNING -> EXITING`とし、渡された`int32_t`値を終了ステータスとして保存する。Scheduler有効時はScheduler Contextへ戻った後に実行資源を回収して`ZOMBIE`へ遷移させる。`exit()`は呼び出し元へ復帰しない。終了値をマスク、符号化、または狭い型へ切り詰めない。
 - `EXITING`は実行選択・`wait()`回収・スロット再利用の対象外。親の起床は`ZOMBIE`確定後とする。
-- `ZOMBIE`はPID、親PID、終了ステータスを残し、実行資源を保持しない。親の`wait()`で回収して初めて`FREE`となる。
+- `ZOMBIE`はPID、親PID、終了ステータスを残し、実行スタック・Context等の実行資源を保持しない。親の`wait()`で回収して初めてProcess枠が`FREE`となる。
 - 状態変更は`ProcessManager`に集約する。排他制御やプリエンプティブ/マルチプロセッサ対応の詳細は未確定。
 
 ## 4. プロセステーブル・PID
@@ -147,7 +149,7 @@ FREE -> CREATING -> READY -> RUNNING
 
 ## 5. 現在実行中のProcessの参照
 
-`ProcessManager`が現在実行中のProcessへの内部ポインタ等を1つ保持し、一般コードに直接公開せず`current()`を経由して取得する。単一CPUを前提とし、ホストOSのスレッドローカルストレージを必須としない。
+`ProcessManager`が現在実行中のProcessへの内部ポインタ等を1つ保持し、一般コードに直接公開せず`current()`を経由して取得する。Scheduler Context上ではProcessが実行主体ではないため、現在Process参照を空にする。単一CPUを前提とし、ホストOSのスレッドローカルストレージを必須としない。
 
 ```cpp
 // 概念上のアクセスAPI（確定宣言ではない）
@@ -169,13 +171,13 @@ Process& ProcessManager::current();
 - `ucontext_t`などのホスト依存型をProcessの一般公開APIに露出させない。
 - Context層は実行コンテキストの初期化・保存・復帰を扱い、PIDやFD等のプロセス管理を扱わない。
 
-スタックの確保場所・容量・ガード機構・所有者、およびContext層のAPIや具体的な内部型は未確定。ホスト実装での`ucontext`動作確認も今後の作業とする。将来のプリエンプティブ切替には割り込みやシグナル等の追加設計が必要であり、本書は協調方式からの移行を保証する詳細仕様をまだ規定しない。
+ホストLinuxの協調Context、独立スタック、ガードページ、Context無効の互換モードは[`process_context_implementation_spec.md`](process_context_implementation_spec.md)で定める。協調Schedulerの選択・dispatch規則は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)で定める。将来のプリエンプティブ切替には割り込み等の別設計が必要である。マイコン向けContext実装はCPU固有バックエンドとして後続仕様で定める。
 
 ## 7. プロセス生成と内蔵ユーザーバイナリ
 
 ### 7.1 spawnの方針
 
-`spawn()`は指定プログラムを新規プロセスとして開始する。親アドレス空間の複製を行う純粋な`fork()`は実装しない。`vfork()`の採否は未確定であり、現段階で実装対象に加えない。初期内部APIは内蔵バイナリの関数ポインタを受け取る。初期同期段階における引数、スタックを作らずwait時に子を実行する動作、生成失敗時の処理は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に定める。Scheduler導入後の起動時メモリ割当・実行イメージの詳細は別途検討する。
+`spawn()`は指定プログラムを新規プロセスとして開始する。親アドレス空間の複製を行う純粋な`fork()`は実装しない。`vfork()`の採否は未確定であり、現段階で実装対象に加えない。初期内部APIは内蔵バイナリの関数ポインタを受け取る。引数、生成失敗時の処理、Scheduler無効のwait駆動互換動作は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)、Scheduler有効時の動作は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。
 
 ### 7.2 内蔵バイナリの維持
 
@@ -188,7 +190,7 @@ namespace kernel {
 }
 ```
 
-`user_binary()`は名前から既存の静的リンク済み入口関数を検索し、未登録なら`nullptr`を返す。検索自体はProcess生成やFD操作を行わない。現在の`init`直接呼び出しは暫定実装とし、将来はProcessの独立スタック上で呼び出す構成を検討する。内蔵バイナリが共有アドレス空間で動作することと、完全なプロセス間メモリ隔離は別問題である。
+`user_binary()`は名前から既存の静的リンク済み入口関数を検索し、未登録なら`nullptr`を返す。検索自体はProcess生成やFD操作を行わない。初期同期段階では`init`を起動Contextから直接呼ぶ。協調Scheduler段階では`init`も独立Context上で実行する。内蔵バイナリが共有アドレス空間で動作することと、完全なプロセス間メモリ隔離は別問題である。
 
 ファイルシステムからロードするユーザーバイナリについては全体仕様の既存技術検証・制約（ホストの位置非依存コード、`kvec`/`dispatch`方式など）を参照し、本書では実行形式を新たに確定しない。
 
@@ -202,7 +204,7 @@ bool retain_file_description(FileDescription& desc);
 void release_file_description(FileDescription& desc);
 ```
 
-`spawn()`でFDを継承する際は、親子の各fdが**同一FileDescription**を参照する。継承したfdごとに`retain_file_description()`を行い、テーブルの単純コピーで代用しない。共有するFileDescriptionのfile positionも共有される。継承途中の失敗時は子に登録済みのFDを`detach()`し、対応する参照を`release_file_description()`してロールバックする。FDごとにretainと対応する解放を正しく行う。`exit()`時には全FDを切り離して参照を解放する。詳細な例外的失敗・cleanupの扱いはFD仕様に従う。
+`spawn()`が継承するfd番号は`inherit_fds`と`inherit_fd_count`で指定する。`nullptr, 0`は親の全open fd、非NULL pointerとcount 0は継承なし、それ以外は指定されたfdだけを同じ番号で継承する。親子の各継承fdは**同一FileDescription**を参照する。継承したfdごとに`retain_file_description()`を行い、テーブルの単純コピーで代用しない。共有するFileDescriptionのfile positionも共有される。継承途中の失敗時は子に登録済みのFDを`detach()`し、対応する参照を`release_file_description()`してロールバックする。`exit()`時には子の全FDを切り離して参照を解放する。詳細な検証と失敗条件は[`spawn_wait_implimentation_spec.md`](spawn_wait_implimentation_spec.md)に従う。
 
 ## 8.1 cwdの所有と寿命
 
@@ -237,7 +239,7 @@ void release_file_description(FileDescription& desc);
 
 ### 9.2 後続段階への移行
 
-将来、通常の`spawn()`とSchedulerを導入した段階では、ProcessにContextと独立スタックを追加し、`init`の起動も通常のプロセス生成へ統合することを検討する。内蔵ユーザーバイナリの検索機構は維持する。LinuxホストのContext層には`ucontext`を採用し、カーネル起動／Scheduler側のコンテキストはProcessのコンテキストと区別する。
+Contextを生成しない`NO_CONTEXT`互換モードでは従来の同一スタック・wait駆動実行を維持する。`HOST_UCONTEXT`で協調Schedulerを有効にする段階では、`init`を含む各Processに独立Contextとスタックを用意し、`kernel::startup()`からScheduler run loopへ入る。`init`入口をカーネル起動Contextから直接呼び出さない。Context仕様とScheduler仕様に従う。
 
 ## 10. ProcessManager内部API（合意事項）
 
@@ -268,6 +270,8 @@ public:
         UserBinaryType entry,
         int argc,
         const char* const argv[],
+        const int32_t* inherit_fds,
+        uint32_t inherit_fd_count,
         OptionalConstProcessRef parent
     );
 
@@ -290,24 +294,24 @@ private:
 };
 ```
 
-通常のカーネル利用者に対する公開メソッドは、`find()`、`current()`、`spawn()`、`exit_current()`、`wait_child()`を基本とする。syscall境界で終了値の出力に成功してから子を回収するため、`reap_child(pid_t)`もProcessManagerの内部APIとして設ける。このAPIは指定PIDが呼出し元の子であり、まだ`ZOMBIE`である場合だけ`FREE`へ遷移させる。不一致や状態不整合の場合は失敗し、Process状態を変更しない。`current()`はProcessが存在する文脈でのみ呼ぶ。Scheduler向けの状態更新は一般公開せず、詳細はScheduler仕様と合わせて決定する。内部表現の生ポインタは一般APIへ公開しない。
+通常のカーネル利用者に対する公開メソッドは、`find()`、`current()`、`spawn()`、`exit_current()`、`wait_child()`を基本とする。syscall境界で終了値の出力に成功してから子を回収するため、`reap_child(pid_t)`もProcessManagerの内部APIとして設ける。このAPIは指定PIDが呼出し元の子であり、まだ`ZOMBIE`である場合だけ`FREE`へ遷移させる。不一致や状態不整合の場合は失敗し、Process状態を変更しない。`current()`はProcessが存在する文脈でのみ呼ぶ。Scheduler向け状態変更とdispatchの境界は[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)に従う。内部表現の生ポインタは一般APIへ公開しない。
 
 通常の`spawn()`は`std::cref(manager.current())`等を親として渡す。起動時の`init`生成では`std::nullopt`を指定し、`ppid = 0`とする。`std::nullopt`は「親Processなし」を表し、PID 0のProcessの参照を意味しない。子が起動時に使う`argv`の有効期間は親のスタックに依存させない。
 
 ### 10.3 生成・終了・待機の内部処理
 
-- **生成**：独立ContextとSchedulerを導入した段階では、`FREE`スロットを`CREATING`として予約し、PID・親子関係、プログラム・スタック・Context、FD継承を準備する。すべて成功したら`READY`とする。初期同期段階ではスタック・Contextを作らず、詳細仕様に従い`READY`（未実行）にする。途中失敗では確保資源を元に戻して`FREE`へ。PIDの欠番は許容する。
-- **終了**：`exit_current(status)`で`EXITING`へ遷移し、`status`を`int32_t`のまま終了値として保存する。FDを解放し、孤児となる子（ZOMBIEを含む）を原則PID 1へ引き継ぐ。Schedulerへ非復帰で切り替えた後、`finish_exit()`相当の処理で終了プロセスが使っていたスタック・Context・実行イメージを回収し、PID・PPID・終了値を残した`ZOMBIE`へ遷移させて親を起床させる。`sys_exit(status)`は`exit_current(status)`へ委譲し、復帰しない。
-- **待機**：`wait_child()`は成功時に子PIDと終了値を返すが、その時点では子を`ZOMBIE`のまま保持する。`sys_wait(status_ptr)`は`status_ptr == nullptr`でない場合、syscall境界で出力先を検証し、安全なuser-copy経路で終了値を書き込む。書き込みが成功した後に限り`reap_child(pid)`を呼び、子を`FREE`へ戻す。出力先の検証または書き込みに失敗した場合は`-1`を返し、子を`ZOMBIE`のまま残して次回waitで回収可能にする。`status_ptr == nullptr`なら終了値の出力を省略し、回収を確定する。子がいなければ`ECHILD`相当のエラー、未終了の子だけなら`WAITING(CHILD)`としてスケジューラへ移譲する。初期同期段階では、詳細仕様に従い最古の未実行子を関数呼出しで実行し、結果出力成功後に回収する。特定PID指定の`waitpid()`は現段階で追加しない。
+- **生成**：`FREE`スロットを`CREATING`として予約し、PID・親子関係、プログラム・引数・FD継承を準備する。Scheduler有効時は専用スタックとContextも初期化し、全準備成功後に`READY`とする。`NO_CONTEXT`ではスタック・Contextを作らず、wait時に親スタック上で実行する。途中失敗では確保資源を元に戻して`FREE`へ。PIDの欠番は許容する。
+- **終了**：`exit_current(status)`で`EXITING`へ遷移し、`status`を`int32_t`のまま終了値として保存する。FDを解放し、孤児となる子（ZOMBIEを含む）を原則PID 1へ引き継ぐ。Scheduler有効時はScheduler Contextへ戻った後に終了したProcessのContext/stackを解放し、`ZOMBIE`として確定して待機中の親を起床させる。`reap_child()`は終了情報とProcess枠を回収する。`NO_CONTEXT`では子入口のreturnを終了として扱う。`sys_exit(status)`はContext有効時に`exit_current(status)`へ委譲し、復帰しない。
+- **待機**：`wait_child()`は成功時に子PIDと終了値を返すが、その時点では子を`ZOMBIE`のまま保持する。`sys_wait(status_ptr)`は`status_ptr == nullptr`でない場合、syscall境界で出力先を検証し、安全なuser-copy経路で終了値を書き込む。書き込みが成功した後に限り`reap_child(pid)`を呼び、子を`FREE`へ戻す。出力先の検証または書き込みに失敗した場合は`-1`を返し、子を`ZOMBIE`のまま残して次回waitで回収可能にする。`status_ptr == nullptr`なら終了値の出力を省略し、回収を確定する。子がいなければ`ECHILD`相当のエラー、未終了の子だけなら親を`WAITING(CHILD)`にしてSchedulerへ制御を渡す。wait駆動方式は`NO_CONTEXT`互換モードに限り最古の未実行子へ切り替える。特定PID指定の`waitpid()`は現段階で追加しない。
 - **init終了**：PID 1のinit終了時は通常の孤児引継ぎ・回収処理と区別し、カーネル側の停止処理へ移行する。停止の詳細は未確定。
 
 ### 10.4 今後決定する事項
 
 1. `ProcessResult`、`WaitResult`の構造とエラー表現、syscall ABIへの変換。
 2. `pid_t`の具体的なABI、PID上限と循環探索、`MAX_PROCESSES`の数値。
-3. スタック・Contextの所有形態、実行イメージ・`argc/argv`の保管、外部バイナリのロード方法。
-4. Schedulerとの切替API・`friend`範囲、待機や起床の詳細契約、停止処理。
-5. `sleep()`、シグナル、パイプの待機理由と将来のプリエンプティブ・マルチプロセッサ対応。
+3. マイコンContextの内部表現、実行イメージ・`argc/argv`の保管、外部バイナリのロード方法。
+4. MCU向けHAL timer/idle機構での正数`sleep()`有効化時期、およびScheduler run loop終了後の停止処理。ホストHALは[`host_hal_tick_wait_spec.md`](host_hal_tick_wait_spec.md)で定める。
+5. シグナル、パイプの待機条件と将来のプリエンプティブ・マルチプロセッサ対応。
 6. 標準FD初期化時のcleanup失敗の詳細（初期Processへの直接登録方式は9.1節で確定）。
 
 ## 11. 最小実装の段階
@@ -315,7 +319,7 @@ private:
 第1段階のみ実装順序を確定する。後続段階は引き続き候補である。
 
 1. **確定：** PID 1用の最小`Process`、固定長テーブル、`initialize_init_process()`、`current()`、プロセス所有`FdTable`、標準FD設定と`read/write`の検証。ContextとSchedulerは不要。
-2. **後続候補：** Context・独立スタックを導入し、内蔵`init`を切り替え可能なProcessとして起動する。
-3. **後続候補：** 通常の`spawn()`、FD継承、PID循環割当、ロールバック。
-4. **後続候補：** `exit()`・`wait()`、ZOMBIE回収。
-5. **後続候補：** 協調スケジューリング、`sleep()`、パイプ。
+2. **次段階：** `HOST_UCONTEXT`と`NO_CONTEXT`のビルド選択、および通常の`spawn()`子に対するContext・独立スタックを導入する。起動時`init`の専用Context化は別途扱う。
+3. **後続候補：** FD継承、PID循環割当、Context生成を含むrollbackを確認する。
+4. **後続候補：** `exit()`・`wait()`・ZOMBIE回収をwait駆動Context方式へ接続する。
+5. **後続候補：** 協調Scheduler（[`cooperative_scheduler_spec.md`](cooperative_scheduler_spec.md)）、正数`sleep()`のMCU向けHAL機構、パイプ、マイコン固有Context backend。
